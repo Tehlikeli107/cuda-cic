@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+_ext_cache/
+*.o
+*.so
+*.dll
+*.exe
+*.exp
+*.lib
+*.cubin
+*.ptx
+.venv/

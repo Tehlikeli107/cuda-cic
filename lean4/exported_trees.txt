@@ -1,0 +1,288 @@
+=== THEOREM Nat.add_comm ===
+FORALL n
+  CONST Nat
+  FORALL m
+    CONST Nat
+    APP
+      APP
+        APP
+          CONST Eq
+          CONST Nat
+        APP
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    CONST HAdd.hAdd
+                    CONST Nat
+                  CONST Nat
+                CONST Nat
+              APP
+                APP
+                  CONST instHAdd
+                  CONST Nat
+                CONST instAddNat
+            BVAR 1
+          BVAR 0
+      APP
+        APP
+          APP
+            APP
+              APP
+                APP
+                  CONST HAdd.hAdd
+                  CONST Nat
+                CONST Nat
+              CONST Nat
+            APP
+              APP
+                CONST instHAdd
+                CONST Nat
+              CONST instAddNat
+          BVAR 0
+        BVAR 1
+---
+=== THEOREM Nat.add_zero ===
+FORALL n
+  CONST Nat
+  APP
+    APP
+      APP
+        CONST Eq
+        CONST Nat
+      APP
+        APP
+          APP
+            APP
+              APP
+                APP
+                  CONST HAdd.hAdd
+                  CONST Nat
+                CONST Nat
+              CONST Nat
+            APP
+              APP
+                CONST instHAdd
+                CONST Nat
+              CONST instAddNat
+          BVAR 0
+        APP
+          APP
+            APP
+              CONST OfNat.ofNat
+              CONST Nat
+            NATLIT 0
+          APP
+            CONST instOfNatNat
+            NATLIT 0
+    BVAR 0
+---
+=== THEOREM Nat.zero_add ===
+FORALL n
+  CONST Nat
+  APP
+    APP
+      APP
+        CONST Eq
+        CONST Nat
+      APP
+        APP
+          APP
+            APP
+              APP
+                APP
+                  CONST HAdd.hAdd
+                  CONST Nat
+                CONST Nat
+              CONST Nat
+            APP
+              APP
+                CONST instHAdd
+                CONST Nat
+              CONST instAddNat
+          APP
+            APP
+              APP
+                CONST OfNat.ofNat
+                CONST Nat
+              NATLIT 0
+            APP
+              CONST instOfNatNat
+              NATLIT 0
+        BVAR 0
+    BVAR 0
+---
+=== THEOREM Nat.add_assoc ===
+FORALL n
+  CONST Nat
+  FORALL m
+    CONST Nat
+    FORALL k
+      CONST Nat
+      APP
+        APP
+          APP
+            CONST Eq
+            CONST Nat
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    APP
+                      CONST HAdd.hAdd
+                      CONST Nat
+                    CONST Nat
+                  CONST Nat
+                APP
+                  APP
+                    CONST instHAdd
+                    CONST Nat
+                  CONST instAddNat
+              APP
+                APP
+                  APP
+                    APP
+                      APP
+                        APP
+                          CONST HAdd.hAdd
+                          CONST Nat
+                        CONST Nat
+                      CONST Nat
+                    APP
+                      APP
+                        CONST instHAdd
+                        CONST Nat
+                      CONST instAddNat
+                  BVAR 2
+                BVAR 1
+            BVAR 0
+        APP
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    CONST HAdd.hAdd
+                    CONST Nat
+                  CONST Nat
+                CONST Nat
+              APP
+                APP
+                  CONST instHAdd
+                  CONST Nat
+                CONST instAddNat
+            BVAR 2
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    APP
+                      CONST HAdd.hAdd
+                      CONST Nat
+                    CONST Nat
+                  CONST Nat
+                APP
+                  APP
+                    CONST instHAdd
+                    CONST Nat
+                  CONST instAddNat
+              BVAR 1
+            BVAR 0
+---
+=== THEOREM Nat.succ_add ===
+FORALL n
+  CONST Nat
+  FORALL m
+    CONST Nat
+    APP
+      APP
+        APP
+          CONST Eq
+          CONST Nat
+        APP
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    CONST HAdd.hAdd
+                    CONST Nat
+                  CONST Nat
+                CONST Nat
+              APP
+                APP
+                  CONST instHAdd
+                  CONST Nat
+                CONST instAddNat
+            APP
+              CONST Nat.succ
+              BVAR 1
+          BVAR 0
+      APP
+        CONST Nat.succ
+        APP
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    CONST HAdd.hAdd
+                    CONST Nat
+                  CONST Nat
+                CONST Nat
+              APP
+                APP
+                  CONST instHAdd
+                  CONST Nat
+                CONST instAddNat
+            BVAR 1
+          BVAR 0
+---
+=== THEOREM Nat.mul_comm ===
+FORALL n
+  CONST Nat
+  FORALL m
+    CONST Nat
+    APP
+      APP
+        APP
+          CONST Eq
+          CONST Nat
+        APP
+          APP
+            APP
+              APP
+                APP
+                  APP
+                    CONST HMul.hMul
+                    CONST Nat
+                  CONST Nat
+                CONST Nat
+              APP
+                APP
+                  CONST instHMul
+                  CONST Nat
+                CONST instMulNat
+            BVAR 1
+          BVAR 0
+      APP
+        APP
+          APP
+            APP
+              APP
+                APP
+                  CONST HMul.hMul
+                  CONST Nat
+                CONST Nat
+              CONST Nat
+            APP
+              APP
+                CONST instHMul
+                CONST Nat
+              CONST instMulNat
+          BVAR 0
+        BVAR 1
+---
