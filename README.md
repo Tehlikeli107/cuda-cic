@@ -174,7 +174,7 @@ If you use CUDA-CIC in your research, please cite:
 ```
 @software{cuda-cic,
   title={CUDA-CIC: GPU-Accelerated Type Checker for Lean4's Type Theory},
-  author={Salih Can Kurnaz},
+  author={Tehlikeli107},
   year={2026},
   url={https://github.com/Tehlikeli107/cuda-cic}
 }
