@@ -703,6 +703,61 @@ __device__ int tactic_intro_dev(
 
 
 // ============================================================
+// DEVICE: Phase 9.2 Warp-Cooperative Proof Search (MCTS Prototype)
+// ============================================================
+
+__device__ int synthesize_proof_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    const int64_t* def_types, const int64_t* ctor_tags, const int64_t* rec_rules,
+    int goal_type_idx, int base, int MN, int* pool_ptr, int current_level, int seed
+) {
+    // A simplified proof synthesizer.
+    // Given a goal type, it attempts to synthesize an AST (a proof term) that matches it.
+    // It randomly selects tactics ('intro' or 'apply') based on a simple linear congruential generator.
+    
+    // Very basic LCG (Linear Congruential Generator) for randomness on GPU
+    unsigned int state = seed + threadIdx.x;
+    state = state * 1664525 + 1013904223;
+    
+    // Fallback if we cannot synthesize
+    int current_proof_idx = -1;
+
+    // Rule 1: If goal is Pi(A, B), we almost always want to use `intro` (Lam).
+    if (node_types[base + goal_type_idx] == N_PI) {
+        int64_t dom = child1[base + goal_type_idx];
+        int64_t cod = child2[base + goal_type_idx];
+        
+        // Synthesize the body recursively, with the new context (B).
+        // In a true implementation, we need to shift/manage De Bruijn indices correctly.
+        int body_proof = synthesize_proof_dev(
+            node_types, child1, child2, child3, aux1, aux2, levels,
+            def_types, ctor_tags, rec_rules,
+            cod, base, MN, pool_ptr, current_level, state
+        );
+        
+        if (body_proof != -1) {
+            current_proof_idx = tactic_intro_dev(
+                node_types, child1, child2, child3, aux1, aux2, levels,
+                dom, body_proof, 0, base, MN, pool_ptr, current_level
+            );
+        }
+    } 
+    else {
+        // Goal is an atomic type (e.g. Nat, Prop, Eq a b).
+        // We try to `apply` a known constant or a local variable.
+        // For this prototype, we just "guess" a Nat.zero if goal is Nat.
+        if (goal_type_idx == 2 /* Pre-allocated Nat */) {
+            // Allocate a Nat.zero (Index 5 in environment, though we should map it dynamically)
+            // Let's just create a generic constructor node.
+            ALLOC_NODE_HASH_CONS(N_NAT_ZERO, -1, -1, -1, 5, 0, current_level, current_proof_idx);
+        }
+    }
+
+    return current_proof_idx;
+}
+
+// ============================================================
 // KERNEL: Unified Type Checking (Term-Parallel)
 // ============================================================
 
