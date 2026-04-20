@@ -379,6 +379,18 @@ class GPUVerifier:
         self.const_types = torch.from_numpy(env.to_numpy()).to(DEVICE)
         self.lookup = torch.from_numpy(env.build_lookup_array()).to(DEVICE)
         self.def_types = torch.zeros(MAX_CONSTS, dtype=torch.long, device=DEVICE)
+        
+        # Load Phase 8.7 metadata
+        self.ctor_tags = torch.full((MAX_CONSTS,), -1, dtype=torch.long, device=DEVICE)
+        self.rec_rules = torch.zeros(MAX_CONSTS, dtype=torch.long, device=DEVICE)
+        
+        for cid, tag in env.id_to_tag.items():
+            if 0 <= cid < MAX_CONSTS:
+                self.ctor_tags[cid] = tag
+                
+        for cid, rule in env.id_to_rule.items():
+            if 0 <= cid < MAX_CONSTS:
+                self.rec_rules[cid] = rule
 
         print("Compiling CIC engine...")
         from torch.utils.cpp_extension import load
@@ -389,7 +401,7 @@ class GPUVerifier:
         )
         print("OK")
 
-    def verify_batch(self, candidates: List[ProofCandidate], max_nodes: int = 32) -> float:
+    def verify_batch(self, candidates: List[ProofCandidate], max_nodes: int = 32, method="verify") -> float:
         """Type-check all candidates on GPU. Returns GPU time in ms."""
         if not candidates:
             return 0.0
@@ -423,10 +435,20 @@ class GPUVerifier:
         ev_e = torch.cuda.Event(enable_timing=True)
         ev_s.record()
 
-        valid, root_types, _, _ = self.engine.cic_engine_pipeline(
-            tensors[0], tensors[1], tensors[2], tensors[3],
-            tensors[4], tensors[5], tensors[6], g_roots,
-            self.lookup, self.const_types, self.def_types, max_level)
+        if method == "search":
+            valid, root_types, result_nodes, _ = self.engine.cic_engine_search(
+                tensors[0], tensors[1], tensors[2], tensors[3],
+                tensors[4], tensors[5], tensors[6], g_roots,
+                self.lookup, self.const_types, self.def_types,
+                self.ctor_tags, self.rec_rules, max_level)
+            
+            # Extract synthesized AST sizes or success indicators if needed
+        else:
+            valid, root_types, _, _ = self.engine.cic_engine_pipeline(
+                tensors[0], tensors[1], tensors[2], tensors[3],
+                tensors[4], tensors[5], tensors[6], g_roots,
+                self.lookup, self.const_types, self.def_types,
+                self.ctor_tags, self.rec_rules, max_level)
 
         ev_e.record(); torch.cuda.synchronize()
         gpu_ms = ev_s.elapsed_time(ev_e)
