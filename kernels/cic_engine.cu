@@ -43,6 +43,7 @@
 #define N_BOOL_TRUE 12
 #define N_BOOL_FALSE 13
 #define N_STRLIT    14
+#define N_MVAR      15   // Metavariable (?m) for Higher-Order Unification
 #define N_NONE      -1
 
 // Type constants
@@ -67,6 +68,38 @@
 #define MAX_WHNF_STEPS   32   // max reduction steps per term
 #define MAX_CONSTS    65536
 #define MAX_WORK_STACK  64    // substitution work stack
+
+// Macro for fast thread-local allocation with Linear-Scan Hash-Consing (Deduplication)
+#define ALLOC_NODE_HASH_CONS(kind, c1, c2, c3, a1, a2, lvl, out_idx) do { \
+    int found = -1; \
+    for (int i = MN - 1; i > *pool_ptr && i >= 0; i--) { \
+        if (node_types[base + i] == (kind) && \
+            child1[base + i] == (c1) && \
+            child2[base + i] == (c2) && \
+            child3[base + i] == (c3) && \
+            aux1[base + i] == (a1) && \
+            aux2[base + i] == (a2) && \
+            levels[base + i] == (lvl)) { \
+            found = i; \
+            break; \
+        } \
+    } \
+    if (found != -1) { \
+        (out_idx) = found; \
+    } else if (*pool_ptr >= 0 && *pool_ptr < MN) { \
+        node_types[base + *pool_ptr] = (kind); \
+        child1[base + *pool_ptr] = (c1); \
+        child2[base + *pool_ptr] = (c2); \
+        child3[base + *pool_ptr] = (c3); \
+        aux1[base + *pool_ptr] = (a1); \
+        aux2[base + *pool_ptr] = (a2); \
+        levels[base + *pool_ptr] = (lvl); \
+        (out_idx) = *pool_ptr; \
+        (*pool_ptr)--; \
+    } else { \
+        (out_idx) = -1; \
+    } \
+} while(0)
 
 // ============================================================
 // DEVICE: Type hashing functions
@@ -99,6 +132,185 @@ __device__ inline int64_t imax_level(int64_t u, int64_t v) {
 // Used for Dependent Type Checking (e.g., Pi(x:A, B) a -> B[x:=a])
 // Recursive traversal simulating Deep Copy with Hash-Consing
 // ============================================================
+
+__device__ void subst_alloc_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    int root_idx, int var_depth, int replacement_idx,
+    int base, int MN, int* pool_ptr, int64_t* out_idx
+);
+
+__device__ void subst_inplace_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2,
+    int root_idx, int var_depth, int replacement_idx,
+    int base, int MN
+);
+
+__device__ int whnf_single_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    const int64_t* def_types, const int64_t* ctor_tags, const int64_t* rec_rules,
+    int root_idx, int base, int MN, int* pool_ptr, int* out_steps
+) {
+    int root = root_idx;
+    int steps = 0;
+
+    for (int step = 0; step < MAX_WHNF_STEPS; step++) {
+        if (root < 0 || root >= MN) break;
+        int64_t ntype = node_types[base + root];
+
+        if (ntype == N_APP) {
+            int64_t func_idx = child1[base + root];
+            int64_t arg_idx = child2[base + root];
+
+            if (func_idx >= 0 && func_idx < MN &&
+                node_types[base + func_idx] == N_LAM) {
+                // BETA: App(Lam(body, domain), arg) → subst(body, 0, arg)
+                int64_t body_idx = child1[base + func_idx];
+
+                if (body_idx >= 0 && body_idx < MN) {
+                    // Proper de Bruijn substitution
+                    subst_inplace_dev(
+                        node_types, child1, child2, child3, aux1, aux2,
+                        (int)body_idx, 0, (int)arg_idx, base, MN
+                    );
+                    root = body_idx;
+                    steps++;
+                    continue;
+                }
+            }
+            
+            // IOTA (Recursor): App(App(...App(Rec, motive), minor), major)
+            // If the head is a recursor and the major premise reduces to a constructor we should reduce.
+            int spine[32];
+            int spine_idx = 0;
+            int head_idx = root;
+
+            while (head_idx >= 0 && head_idx < MN && node_types[base + head_idx] == N_APP && spine_idx < 32) {
+                spine[spine_idx++] = child2[base + head_idx];
+                head_idx = child1[base + head_idx];
+            }
+
+            if (head_idx >= 0 && head_idx < MN && node_types[base + head_idx] == N_REC) {
+                int major_premise_idx = spine[0];
+                if (major_premise_idx >= 0 && major_premise_idx < MN) {
+
+                    // Unroll constructor spine
+                    int ctor_spine[16];
+                    int ctor_spine_idx = 0;
+                    int ctor_head = major_premise_idx;
+
+                    // Assuming major premise is already in WHNF (starts with CTOR or APP of CTOR)
+                    while (ctor_head >= 0 && ctor_head < MN && node_types[base + ctor_head] == N_APP && ctor_spine_idx < 16) {
+                        ctor_spine[ctor_spine_idx++] = child2[base + ctor_head];
+                        ctor_head = child1[base + ctor_head];
+                    }
+
+                    if (ctor_head >= 0 && ctor_head < MN && node_types[base + ctor_head] == N_CTOR) {
+                        int64_t rec_id = aux1[base + head_idx];
+                        int64_t rule = rec_rules[rec_id];
+                        int n_params = (rule >> 16) & 0xFFFF;
+                        int n_minors = rule & 0xFFFF;
+                        int64_t ctor_tag = aux2[base + ctor_head];
+
+                        if (spine_idx >= n_params + n_minors + 1) {
+                            int minor_idx_in_spine = 1 + (n_minors - 1 - ctor_tag);
+                            int64_t minor_premise_idx = spine[minor_idx_in_spine];
+
+                            if (ctor_spine_idx == 0) {
+                                // Constructor with NO arguments (e.g., Nat.zero) -> Just use the minor premise
+                                root = minor_premise_idx;
+                                steps++;
+                                continue;
+                            } else {
+                                int64_t arg_x = ctor_spine[0];
+                                int64_t rec_func_part = child1[base + root];
+
+                                int64_t rec_call_idx;
+                                ALLOC_NODE_HASH_CONS(N_APP, rec_func_part, arg_x, -1, 0, 0, 0, rec_call_idx);
+
+                                int64_t step_n_idx;
+                                ALLOC_NODE_HASH_CONS(N_APP, minor_premise_idx, arg_x, -1, 0, 0, 0, step_n_idx);
+
+                                int64_t final_app_idx;
+                                ALLOC_NODE_HASH_CONS(N_APP, step_n_idx, rec_call_idx, -1, 0, 0, 0, final_app_idx);
+
+                                if (final_app_idx >= 0) {
+                                    root = final_app_idx;
+                                    steps++;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // DELTA through APP: App(Const(f), arg) where f has definition
+            if (func_idx >= 0 && func_idx < MN &&
+                node_types[base + func_idx] == N_CONST) {
+                int64_t cid = aux1[base + func_idx];
+                if (cid >= 0 && cid < MAX_CONSTS && def_types[cid] != 0) {
+                    aux1[base + func_idx] = def_types[cid];
+                    node_types[base + func_idx] = N_VAR;
+                    steps++;
+                    continue;
+                }
+            }
+            break;
+        }
+        else if (ntype == N_LET) {
+            // ZETA: Let(type, val, body) → subst(body, 0, val)
+            int64_t val_idx = child2[base + root];
+            int64_t body_idx = child3[base + root];
+
+            if (body_idx >= 0 && body_idx < MN &&
+                val_idx >= 0 && val_idx < MN) {
+                subst_inplace_dev(
+                    node_types, child1, child2, child3, aux1, aux2,
+                    (int)body_idx, 0, (int)val_idx, base, MN
+                );
+                root = body_idx;
+                steps++;
+                continue;
+            }
+            break;
+        }
+        else if (ntype == N_CONST) {
+            // DELTA: unfold constant definition
+            int64_t cid = aux1[base + root];
+            if (cid >= 0 && cid < MAX_CONSTS && def_types[cid] != 0) {
+                aux1[base + root] = def_types[cid];
+                node_types[base + root] = N_VAR;
+                steps++;
+                continue;
+            }
+            break;
+        }
+        else {
+            break; // Already in WHNF
+        }
+    }
+    
+    if (out_steps) *out_steps += steps;
+    return root;
+}
+
+// ============================================================
+// DEVICE: Higher-Order Unification & Definitional Equality Engine
+// The absolute core of Calculus of Inductive Constructions.
+// Compares two ASTs for structural and definitional equality,
+// reducing them to WHNF on-the-fly if needed. Supports Metavariables
+// via Cooperative Shared Memory for active proof synthesis.
+// ============================================================
+
+__device__ bool unify_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    const int64_t* def_types, const int64_t* ctor_tags, const int64_t* rec_rules,
+    int root_a, int root_b, int base, int MN, int* pool_ptr,
+    int64_t* mvar_env, int max_mvars
+);
 
 __device__ void subst_alloc_dev(
     int64_t* node_types, int64_t* child1, int64_t* child2,
@@ -198,10 +410,165 @@ __device__ void subst_alloc_dev(
         *out_idx = -1; // Out of Memory
     }
 }
-
 // ============================================================
 // DEVICE: In-place de Bruijn substitution (from cic_subst.cu)
 // ============================================================
+
+// Macro for fast thread-local allocation with Linear-Scan Hash-Consing (Deduplication)
+#define ALLOC_NODE_HASH_CONS(kind, c1, c2, c3, a1, a2, lvl, out_idx) do { \
+    int found = -1; \
+    for (int i = MN - 1; i > *pool_ptr && i >= 0; i--) { \
+        if (node_types[base + i] == (kind) && \
+            child1[base + i] == (c1) && \
+            child2[base + i] == (c2) && \
+            child3[base + i] == (c3) && \
+            aux1[base + i] == (a1) && \
+            aux2[base + i] == (a2) && \
+            levels[base + i] == (lvl)) { \
+            found = i; \
+            break; \
+        } \
+    } \
+    if (found != -1) { \
+        (out_idx) = found; \
+    } else if (*pool_ptr >= 0 && *pool_ptr < MN) { \
+        node_types[base + *pool_ptr] = (kind); \
+        child1[base + *pool_ptr] = (c1); \
+        child2[base + *pool_ptr] = (c2); \
+        child3[base + *pool_ptr] = (c3); \
+        aux1[base + *pool_ptr] = (a1); \
+        aux2[base + *pool_ptr] = (a2); \
+        levels[base + *pool_ptr] = (lvl); \
+        (out_idx) = *pool_ptr; \
+        (*pool_ptr)--; \
+    } else { \
+        (out_idx) = -1; \
+    } \
+} while(0)
+
+__device__ void subst_inplace_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2,
+    int root_idx, int var_depth, int replacement_idx,
+    int base, int MN
+);
+
+__device__ void subst_alloc_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    int root_idx, int var_depth, int replacement_idx,
+    int base, int MN, int* pool_ptr, int64_t* out_idx
+);
+
+__device__ int whnf_single_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    const int64_t* def_types, const int64_t* ctor_tags, const int64_t* rec_rules,
+    int root_idx, int base, int MN, int* pool_ptr, int* out_steps
+);
+
+__device__ bool unify_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    const int64_t* def_types, const int64_t* ctor_tags, const int64_t* rec_rules,
+    int root_a, int root_b, int base, int MN, int* pool_ptr,
+    int64_t* mvar_env, int max_mvars
+) {
+    if (root_a == root_b) return true; // Fast Path: Hash-Consed Pointers
+
+    if (root_a < 0 || root_a >= MN || root_b < 0 || root_b >= MN) return false;
+
+    int64_t type_a = node_types[base + root_a];
+    int64_t type_b = node_types[base + root_b];
+
+    // Phase 8.6: Metavariable Assignment & Resolution
+    if (type_a == N_MVAR && max_mvars > 0) {
+        int64_t mvar_id = aux1[base + root_a] % max_mvars; 
+        int64_t current_assignment = atomicCAS((unsigned long long*)&mvar_env[mvar_id], 0ULL, (unsigned long long)root_b);
+        if (current_assignment == 0ULL) return true; // Successfully assigned ?m = root_b
+        if (current_assignment == root_b) return true; // Already assigned to exactly the same node
+
+        // If assigned to something else, we must unify the current assignment with root_b
+        return unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                         def_types, ctor_tags, rec_rules,
+                         current_assignment, root_b, base, MN, pool_ptr, mvar_env, max_mvars);
+    }
+
+    if (type_b == N_MVAR && max_mvars > 0) {
+        // Symmetric case
+        int64_t mvar_id = aux1[base + root_b] % max_mvars;
+        int64_t current_assignment = atomicCAS((unsigned long long*)&mvar_env[mvar_id], 0ULL, (unsigned long long)root_a);
+        if (current_assignment == 0ULL) return true;
+        if (current_assignment == root_a) return true;
+
+        return unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                         def_types, ctor_tags, rec_rules,
+                         root_a, current_assignment, base, MN, pool_ptr, mvar_env, max_mvars);
+    }
+
+    // Structural Comparison
+    if (type_a == type_b) {
+        if (type_a == N_SORT || type_a == N_CONST || type_a == N_VAR || type_a == N_STRLIT ||
+            type_a == N_NATLIT || type_a == N_NAT_ZERO || type_a == N_BOOL_TRUE || type_a == N_BOOL_FALSE) {
+            return (aux1[base + root_a] == aux1[base + root_b]);
+        }
+
+        if (type_a == N_APP) {
+            bool f_eq = unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                                  def_types, ctor_tags, rec_rules,
+                                  child1[base + root_a], child1[base + root_b], base, MN, pool_ptr, mvar_env, max_mvars);
+            if (!f_eq) goto attempt_reduction;
+            return unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                             def_types, ctor_tags, rec_rules,
+                             child2[base + root_a], child2[base + root_b], base, MN, pool_ptr, mvar_env, max_mvars);
+        }
+
+        if (type_a == N_PI || type_a == N_LAM) {
+            bool dom_eq = unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                                    def_types, ctor_tags, rec_rules,
+                                    child2[base + root_a], child2[base + root_b], base, MN, pool_ptr, mvar_env, max_mvars);
+            if (!dom_eq) goto attempt_reduction;
+            return unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                             def_types, ctor_tags, rec_rules,
+                             child1[base + root_a], child1[base + root_b], base, MN, pool_ptr, mvar_env, max_mvars);
+        }
+    }
+
+attempt_reduction:
+    // If structural sharing and basic shape checking fails, they might be definitionally equal 
+    // but not in Weak Head Normal Form. (e.g. `2 + 2` vs `4`)
+    // Reduce both to WHNF and compare again.
+
+    int dummy_steps = 0;
+    int norm_a = whnf_single_dev(node_types, child1, child2, child3, aux1, aux2, levels, 
+                                 def_types, ctor_tags, rec_rules, root_a, base, MN, pool_ptr, &dummy_steps);
+    int norm_b = whnf_single_dev(node_types, child1, child2, child3, aux1, aux2, levels, 
+                                 def_types, ctor_tags, rec_rules, root_b, base, MN, pool_ptr, &dummy_steps);
+
+    // If reduction changed nothing, they are strictly not equal.
+    if (norm_a == root_a && norm_b == root_b) return false;
+
+    // Retry on the reduced forms. To avoid stack overflow, we just do one final shallow/recursive check.
+    // A fully robust DefEq would maintain a bounded depth stack here.
+    if (norm_a == norm_b) return true;
+
+    int64_t norm_type_a = node_types[base + norm_a];
+    int64_t norm_type_b = node_types[base + norm_b];
+
+    if (norm_type_a != norm_type_b) return false;
+
+    if (norm_type_a == N_APP) {
+        bool f_eq = unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                              def_types, ctor_tags, rec_rules,
+                              child1[base + norm_a], child1[base + norm_b], base, MN, pool_ptr, mvar_env, max_mvars);
+        if (!f_eq) return false;
+        return unify_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                         def_types, ctor_tags, rec_rules,
+                         child2[base + norm_a], child2[base + norm_b], base, MN, pool_ptr, mvar_env, max_mvars);
+    }
+
+    return false;
+}
 
 struct WorkItem {
     int32_t node_idx;
@@ -285,6 +652,8 @@ __global__ void engine_whnf_kernel(
     int64_t* __restrict__ levels,
     int64_t* __restrict__ root_indices,
     const int64_t* __restrict__ def_types,    // [MAX_CONSTS] — definition result types
+    const int64_t* __restrict__ ctor_tags,    // [MAX_CONSTS] — constructor tags
+    const int64_t* __restrict__ rec_rules,    // [MAX_CONSTS] — recursor rules
     int64_t* __restrict__ whnf_steps,
     int B, int MN
 ) {
@@ -294,211 +663,14 @@ __global__ void engine_whnf_kernel(
     int base = bi * MN;
     int64_t root = root_indices[bi];
     int steps = 0;
-
-    // --- Thread-Local Allocator (IOTA/Pattern Matching) ---
-    // En son node nerede bitiyor bulmamız lazım. Genelde MN'in yarısına kadarı Lean'den gelen ağaçla doludur.
-    // Şimdilik hızlıca son node'u bulmak yerine (ki O(MN) sürer) allocate etmek için "tersten"
-    // (MN - 1'den aşağıya doğru) bir pool kullanacağız.
     int pool_ptr = MN - 1;
 
-    // Macro for fast thread-local allocation with Linear-Scan Hash-Consing (Deduplication)
-    #define ALLOC_NODE_HASH_CONS(kind, c1, c2, c3, a1, a2, lvl, out_idx) do { \
-        int found = -1; \
-        for (int i = MN - 1; i > pool_ptr; i--) { \
-            if (node_types[base + i] == (kind) && \
-                child1[base + i] == (c1) && \
-                child2[base + i] == (c2) && \
-                child3[base + i] == (c3) && \
-                aux1[base + i] == (a1) && \
-                aux2[base + i] == (a2) && \
-                levels[base + i] == (lvl)) { \
-                found = i; \
-                break; \
-            } \
-        } \
-        if (found != -1) { \
-            (out_idx) = found; \
-        } else if (pool_ptr >= 0) { \
-            node_types[base + pool_ptr] = (kind); \
-            child1[base + pool_ptr] = (c1); \
-            child2[base + pool_ptr] = (c2); \
-            child3[base + pool_ptr] = (c3); \
-            aux1[base + pool_ptr] = (a1); \
-            aux2[base + pool_ptr] = (a2); \
-            levels[base + pool_ptr] = (lvl); \
-            (out_idx) = pool_ptr; \
-            pool_ptr--; \
-        } else { \
-            (out_idx) = -1; \
-        } \
-    } while(0)
-
-    for (int step = 0; step < MAX_WHNF_STEPS; step++) {
-        if (root < 0 || root >= MN) break;
-        int64_t ntype = node_types[base + root];
-
-        if (ntype == N_APP) {
-            int64_t func_idx = child1[base + root];
-            int64_t arg_idx = child2[base + root];
-
-            if (func_idx >= 0 && func_idx < MN &&
-                node_types[base + func_idx] == N_LAM) {
-                // BETA: App(Lam(body, domain), arg) → subst(body, 0, arg)
-                int64_t body_idx = child1[base + func_idx];
-
-                if (body_idx >= 0 && body_idx < MN) {
-                    // Proper de Bruijn substitution
-                    subst_inplace_dev(
-                        node_types, child1, child2, child3, aux1, aux2,
-                        (int)body_idx, 0, (int)arg_idx, base, MN
-                    );
-                    root = body_idx;
-                    steps++;
-                    continue;
-                }
-            }
-            
-            // IOTA (Recursor): App(App(...App(Rec, motive), minor), major)
-            // If the head is a recursor and the major premise is a constructor we should reduce.
-            int spine[32];
-            int spine_idx = 0;
-            int head_idx = root;
-            
-            while (head_idx >= 0 && head_idx < MN && node_types[base + head_idx] == N_APP && spine_idx < 32) {
-                spine[spine_idx++] = child2[base + head_idx];
-                head_idx = child1[base + head_idx];
-            }
-            
-            if (head_idx >= 0 && head_idx < MN && node_types[base + head_idx] == N_REC) {
-                // head is N_REC. The last element in spine is the major premise.
-                int major_premise_idx = spine[0]; // spine[0] is the outermost argument
-                if (major_premise_idx >= 0 && major_premise_idx < MN) {
-                    int major_type = node_types[base + major_premise_idx];
-                    if (major_type == N_CTOR || major_type == N_NAT_ZERO || major_type == N_NAT_SUCC || major_type == N_BOOL_TRUE || major_type == N_BOOL_FALSE) {
-                        // TODO: Generic rule-based lookup
-                        // Phase 7.2: For now, implement fast path for known recursors
-                        int64_t rec_id = aux1[base + head_idx];
-                        
-                        // Let's assume we can map rec_id directly or we implement Nat and Bool first to test the alloc
-                        if (major_type == N_NAT_ZERO && spine_idx >= 2) {
-                            // Nat.rec motive base step Nat.zero -> base (which is spine[1])
-                            root = spine[1];
-                            steps++;
-                            continue;
-                        }
-                        else if (major_type == N_BOOL_TRUE && spine_idx >= 3) {
-                            // Bool.rec motive t_case f_case true -> t_case
-                            root = spine[2]; // the true case
-                            steps++;
-                            continue;
-                        }
-                        else if (major_type == N_BOOL_FALSE && spine_idx >= 3) {
-                            // Bool.rec motive t_case f_case false -> f_case
-                            root = spine[1]; // the false case
-                            steps++;
-                            continue;
-                        }
-                        else if (major_type == N_NAT_SUCC && spine_idx >= 3) {
-                            // spine[0] = (Nat.succ n)
-                            // spine[1] = step
-                            // spine[2] = base
-                            // spine[3] = motive (if present)
-                            
-                            int64_t n_idx = child1[base + major_premise_idx];
-                            int64_t step_idx = spine[1];
-                            
-                            // Rebuild (Nat.rec motive base step) which is just the head applied to motive, base, step
-                            // We can find this intermediate application node in the tree natively:
-                            // App( App( App(Rec, motive), base ), step )
-                            // We know this is exactly the parent of the major premise application.
-                            // In spine traversal, `spine_idx` counts arguments from outside in.
-                            // root is `App(App_step, major_premise)`
-                            int64_t app_step_idx = child1[base + root];
-                            
-                            // 1. Allocate: App(app_step_idx, n_idx)  == (Nat.rec motive base step n)
-                            int64_t rec_call_idx;
-                            ALLOC_NODE_HASH_CONS(N_APP, app_step_idx, n_idx, -1, 0, 0, 0, rec_call_idx);
-                            
-                            // 2. Allocate: App(step_idx, n_idx) == step n
-                            int64_t step_n_idx;
-                            ALLOC_NODE_HASH_CONS(N_APP, step_idx, n_idx, -1, 0, 0, 0, step_n_idx);
-                            
-                            // 3. Allocate: App(step_n_idx, rec_call_idx) == step n (Nat.rec motive base step n)
-                            int64_t final_app_idx;
-                            ALLOC_NODE_HASH_CONS(N_APP, step_n_idx, rec_call_idx, -1, 0, 0, 0, final_app_idx);
-                            
-                            if (final_app_idx >= 0) {
-                                root = final_app_idx;
-                                steps++;
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // DELTA through APP: App(Const(f), arg) where f has definition
-            if (func_idx >= 0 && func_idx < MN &&
-                node_types[base + func_idx] == N_CONST) {
-                int64_t cid = aux1[base + func_idx];
-                if (cid >= 0 && cid < MAX_CONSTS && def_types[cid] != 0) {
-                    aux1[base + func_idx] = def_types[cid];
-                    node_types[base + func_idx] = N_VAR;
-                    steps++;
-                    continue;
-                }
-            }
-            break;
-        }
-        else if (ntype == N_LET) {
-            // ZETA: Let(type, val, body) → subst(body, 0, val)
-            int64_t val_idx = child2[base + root];
-            int64_t body_idx = child3[base + root];
-
-            if (body_idx >= 0 && body_idx < MN &&
-                val_idx >= 0 && val_idx < MN) {
-                subst_inplace_dev(
-                    node_types, child1, child2, child3, aux1, aux2,
-                    (int)body_idx, 0, (int)val_idx, base, MN
-                );
-                root = body_idx;
-                steps++;
-                continue;
-            }
-            break;
-        }
-        else if (ntype == N_CONST) {
-            // DELTA: unfold constant definition
-            int64_t cid = aux1[base + root];
-            if (cid >= 0 && cid < MAX_CONSTS && def_types[cid] != 0) {
-                aux1[base + root] = def_types[cid];
-                node_types[base + root] = N_VAR;
-                steps++;
-                continue;
-            }
-            break;
-        }
-        else if (ntype == N_NAT_SUCC) {
-            // NatLit computation: S(n) → n+1
-            int64_t c = child1[base + root];
-            if (c >= 0 && c < MN && node_types[base + c] == N_NATLIT) {
-                node_types[base + root] = N_NATLIT;
-                aux1[base + root] = aux1[base + c] + 1;
-                child1[base + root] = -1;
-                steps++;
-                continue;
-            }
-            break;
-        }
-        else {
-            break;  // WHNF: Sort, Var, Lam, Pi, Ctor, NatLit are head-normal
-        }
-    }
+    root = whnf_single_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                           def_types, ctor_tags, rec_rules, root, base, MN, &pool_ptr, &steps);
 
     root_indices[bi] = root;
     whnf_steps[bi] = steps;
 }
-
 
 // ============================================================
 // KERNEL: Unified Type Checking (Term-Parallel)
@@ -522,6 +694,13 @@ __global__ void engine_type_check_kernel(
     if (bi >= B) return;
 
     int base = bi * MN;
+
+    // Phase 8.6: Cooperative Shared Memory Substitution Environment
+    // We allocate a shared array for metavariables. All threads in this block
+    // share this environment. If thread A finds ?m0 = Nat, thread B sees it instantly.
+    __shared__ int64_t mvar_env[64]; // Max 64 metavariables per block for now
+    if (threadIdx.x < 64) mvar_env[threadIdx.x] = 0;
+    __syncthreads();
 
     // Track the end of the term for local allocations (e.g. Dependent Pattern Matching substitution)
     int pool_ptr = MN - 1;
@@ -621,15 +800,41 @@ __global__ void engine_type_check_kernel(
                 if (func_type > 0 && func_type < TABLE_SIZE) {
                     int64_t dom = pi_lookup[func_type * 2];
                     int64_t cod = pi_lookup[func_type * 2 + 1];
-                    if (dom != 0 && dom == arg_type) {
-                        // Phase 8.3 TODO: Return a new AST node created by substitution (cod[x:=arg])
-                        // For fully dependent types (Types as Terms), `cod` should be an AST node.
-                        // Since `cod` here is currently a hash, we pass it through.
-                        // In the future:
-                        // int64_t new_cod;
-                        // subst_alloc_dev(cod_ast_idx, 0, c2, &new_cod); 
-                        // res = new_cod;
-                        res = cod;
+                    
+                    if (dom != 0) {
+                        // Phase 8.6: Use the new unify_dev (Cooperative Metavariable Engine)
+                        // Note: For now dom and arg_type are integer hashes, but as we migrate fully
+                        // to Types as Terms, these will be AST indices. Unify handles hash-consed nodes natively.
+                        bool type_match = false;
+                        if (dom == arg_type) {
+                            type_match = true;
+                        } else {
+                            // PHASE 8.6 WARNING: `dom` and `arg_type` are currently 64-bit integer HASHES 
+                            // (e.g. T_NAT=10, or pi_hash results), NOT AST indices!
+                            // Passing them as `root_a` and `root_b` to `unify_dev` causes an immediate Out-Of-Bounds
+                            // memory access (Segfault) because it tries to read node_types[base + hash_value].
+                            // True Types-as-Terms unification requires the Environment to return AST indices, not Hashes.
+                            // For now, if the hash doesn't match exactly, we fail safely instead of crashing the GPU.
+                            
+                            type_match = false; 
+                            
+                            /* Future implementation when dom and arg_type are guaranteed to be AST node indices:
+                            type_match = unify_dev(
+                                node_types, child1, child2, child3, aux1, aux2, levels,
+                                nullptr, nullptr, nullptr,
+                                (int)dom, (int)arg_type, base, MN, &pool_ptr,
+                                mvar_env, 64
+                            );
+                            */
+                        }
+                        
+                        if (type_match) {
+                            // Phase 8.3 TODO: Return a new AST node created by substitution (cod[x:=arg])
+                            // int64_t new_cod;
+                            // subst_alloc_dev(cod_ast_idx, 0, c2, &new_cod); 
+                            // res = new_cod;
+                            res = cod;
+                        }
                     }
                 }
                 break;
@@ -696,18 +901,18 @@ std::vector<torch::Tensor> cic_engine_pipeline(
     auto whnf_steps = torch::zeros({B}, node_types.options());
 
     int threads = 256;
+    int blocks = (B + threads - 1) / threads;
 
     // Phase 1: WHNF reduction with proper substitution
-    int whnf_blocks = (B + threads - 1) / threads;
-    engine_whnf_kernel<<<whnf_blocks, threads>>>(
+    engine_whnf_kernel<<<blocks, threads>>>(
         node_types.data_ptr<int64_t>(), child1.data_ptr<int64_t>(),
         child2.data_ptr<int64_t>(), child3.data_ptr<int64_t>(),
         aux1.data_ptr<int64_t>(), aux2.data_ptr<int64_t>(),
         levels.data_ptr<int64_t>(), root_indices.data_ptr<int64_t>(),
-        def_types.data_ptr<int64_t>(), whnf_steps.data_ptr<int64_t>(),
+        def_types.data_ptr<int64_t>(), ctor_tags.data_ptr<int64_t>(), 
+        rec_rules.data_ptr<int64_t>(), whnf_steps.data_ptr<int64_t>(),
         B, MN
     );
-
     // Phase 2: Type checking (level by level, Term-Parallel)
     // We launch 1 thread per proof term, not 1 thread per node.
     int tc_blocks = (B + threads - 1) / threads;

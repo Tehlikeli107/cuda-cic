@@ -167,6 +167,12 @@ class CICEnvironment:
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 lines = f.read().splitlines()
+        except UnicodeDecodeError:
+            try:
+                with open(filepath, 'r', encoding='utf-16') as f:
+                    lines = f.read().splitlines()
+            except:
+                return
         except:
             return
 

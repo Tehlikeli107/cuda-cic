@@ -53,6 +53,7 @@ N_CTOR     = 7
 N_REC      = 8
 N_NATLIT   = 9
 N_STRLIT   = 10
+N_MVAR     = 15   # Metavariable for Higher-Order Unification
 N_NONE     = -1
 
 
@@ -110,6 +111,8 @@ def parse_tree(lines: List[str], start: int = 0) -> Tuple[Optional[ExprNode], in
         node.value = hash(name_or_val) % (2**31) if name_or_val else 0
     elif kind == 'BVAR':
         node.value = int(name_or_val) if name_or_val else 0
+    elif kind == 'MVAR':
+        node.value = hash(name_or_val) % (2**31) if name_or_val else 0
     elif kind == 'SORT':
         node.value = name_or_val
 
@@ -307,6 +310,12 @@ def flatten_tree_v2(tree: ExprNode, env: CICEnvironment) -> Tuple[List[Tuple], i
             val = tree.value if tree.value is not None else 0
             idx = len(nodes)
             nodes.append((N_STRLIT, -1, -1, -1, val, 0, 0))
+            return idx
+            
+        elif kind == 'MVAR':
+            mvar_id = tree.value if tree.value is not None else 0
+            idx = len(nodes)
+            nodes.append((N_MVAR, -1, -1, -1, mvar_id, 0, 0))
             return idx
 
         elif kind == 'SORT':
