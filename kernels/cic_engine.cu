@@ -997,6 +997,122 @@ std::vector<torch::Tensor> cic_engine_pipeline(
 }
 
 
+// ============================================================
+// KERNEL: Cooperative MCTS Proof Search (Phase 9.3)
+// ============================================================
+
+__global__ void engine_search_kernel(
+    int64_t* __restrict__ node_types, int64_t* __restrict__ child1,
+    int64_t* __restrict__ child2, int64_t* __restrict__ child3,
+    int64_t* __restrict__ aux1, int64_t* __restrict__ aux2,
+    int64_t* __restrict__ levels, int64_t* __restrict__ root_indices,
+    const int64_t* __restrict__ def_types, const int64_t* __restrict__ ctor_tags,
+    const int64_t* __restrict__ rec_rules,
+    int target_level, int B, int MN
+) {
+    int bi = blockIdx.x; // One Proof Term per Block (Cooperative)
+    if (bi >= B) return;
+
+    int base = bi * MN;
+    int goal_root = root_indices[bi];
+    
+    // Shared Memory Proof Board (Phase 9.3)
+    __shared__ int goal_type_idx[256];
+    __shared__ int proof_term_idx[256];
+    __shared__ int parent_goal[256];
+    __shared__ int queue_tail;
+    
+    if (threadIdx.x == 0) {
+        queue_tail = 1;
+        goal_type_idx[0] = goal_root; // Root Goal
+        proof_term_idx[0] = -1;       // Not proved yet
+        parent_goal[0] = -1;          // No parent
+    }
+    __syncthreads();
+
+    // Track the end of the term for local allocations
+    int pool_ptr_val = MN - 1;
+    int* pool_ptr = &pool_ptr_val;
+
+    // A simple Monte Carlo loop (to be expanded with actual Backprop)
+    int max_mcts_steps = 100;
+    int step = 0;
+    
+    unsigned int state = bi * 1999 + threadIdx.x; // Seed
+    
+    while (proof_term_idx[0] == -1 && step < max_mcts_steps) {
+        state = state * 1664525 + 1013904223; // LCG
+        
+        // Pick a random unproved goal from the queue
+        int q_size = queue_tail;
+        if (q_size > 0) {
+            int random_goal_idx = state % q_size;
+            
+            if (proof_term_idx[random_goal_idx] == -1) {
+                int current_goal_ast = goal_type_idx[random_goal_idx];
+                
+                // Attempt to synthesize
+                int found_proof = synthesize_proof_dev(
+                    node_types, child1, child2, child3, aux1, aux2, levels,
+                    def_types, ctor_tags, rec_rules,
+                    current_goal_ast, base, MN, pool_ptr, target_level, state
+                );
+                
+                if (found_proof != -1) {
+                    // Try to submit proof (Atomic to prevent overwriting)
+                    atomicCAS(&proof_term_idx[random_goal_idx], -1, found_proof);
+                }
+            }
+        }
+        
+        step++;
+        __syncthreads();
+    }
+    
+    // If root is proved, thread 0 updates the final root_indices
+    if (threadIdx.x == 0 && proof_term_idx[0] != -1) {
+        root_indices[bi] = proof_term_idx[0];
+    }
+}
+
+// ============================================================
+// HOST: MCTS Search Pipeline
+// ============================================================
+
+std::vector<torch::Tensor> cic_engine_search(
+    torch::Tensor node_types, torch::Tensor child1, torch::Tensor child2,
+    torch::Tensor child3, torch::Tensor aux1, torch::Tensor aux2,
+    torch::Tensor levels, torch::Tensor root_indices,
+    torch::Tensor pi_lookup, torch::Tensor const_types,
+    torch::Tensor def_types, torch::Tensor ctor_tags, torch::Tensor rec_rules,
+    int max_level
+) {
+    int B = node_types.size(0);
+    int MN = node_types.size(1);
+
+    // One Block per Theorem. 256 Threads cooperating.
+    int threads = 256;
+    int blocks = B; 
+
+    engine_search_kernel<<<blocks, threads>>>(
+        node_types.data_ptr<int64_t>(), child1.data_ptr<int64_t>(),
+        child2.data_ptr<int64_t>(), child3.data_ptr<int64_t>(),
+        aux1.data_ptr<int64_t>(), aux2.data_ptr<int64_t>(),
+        levels.data_ptr<int64_t>(), root_indices.data_ptr<int64_t>(),
+        def_types.data_ptr<int64_t>(), ctor_tags.data_ptr<int64_t>(), 
+        rec_rules.data_ptr<int64_t>(),
+        max_level, B, MN
+    );
+    
+    // After search, run the standard type checker to verify the synthesized proofs
+    return cic_engine_pipeline(
+        node_types, child1, child2, child3, aux1, aux2,
+        levels, root_indices, pi_lookup, const_types,
+        def_types, ctor_tags, rec_rules, max_level
+    );
+}
+
+
 // Also expose backward-compatible cic_gpu_type_check
 std::vector<torch::Tensor> cic_gpu_type_check(
     torch::Tensor node_types, torch::Tensor child1, torch::Tensor child2,
@@ -1018,6 +1134,8 @@ std::vector<torch::Tensor> cic_gpu_type_check(
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("cic_engine_pipeline", &cic_engine_pipeline,
           "Unified CIC engine: WHNF + TypeCheck with proper substitution");
+    m.def("cic_engine_search", &cic_engine_search,
+          "Phase 9.3: Autonomous MCTS Search Engine");
     m.def("cic_gpu_type_check", &cic_gpu_type_check,
           "Backward-compatible type check interface");
 }
