@@ -919,6 +919,122 @@ __global__ void engine_type_check_kernel(
 
 
 // ============================================================
+// KERNEL: Evolutionary Mutator (Phase 10: MAP-Elites)
+// Mutates AST trees directly in GPU memory using LCG randomness
+// ============================================================
+
+__global__ void engine_mutate_kernel(
+    int64_t* __restrict__ node_types, int64_t* __restrict__ child1,
+    int64_t* __restrict__ child2, int64_t* __restrict__ child3,
+    int64_t* __restrict__ aux1, int64_t* __restrict__ aux2,
+    int64_t* __restrict__ levels, int64_t* __restrict__ root_indices,
+    const int64_t* __restrict__ archive_roots, // Pointers to elite trees
+    int archive_size, int B, int MN, int seed
+) {
+    int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= B) return;
+
+    int base = bi * MN;
+    
+    // Very basic LCG
+    unsigned int state = seed + bi * 1999;
+    state = state * 1664525 + 1013904223;
+
+    // Reset tree to primitives
+    // Phase 8.7 primitives are always at index 0..4
+    for (int i = 5; i < MN; i++) {
+        node_types[base + i] = N_NONE;
+    }
+
+    int pool_ptr_val = MN - 1;
+    int* pool_ptr = &pool_ptr_val;
+    
+    // Select 1-2 parent trees from archive
+    int p1_idx = -1;
+    if (archive_size > 0) {
+        state = state * 1664525 + 1013904223;
+        int archive_id = state % archive_size;
+        p1_idx = archive_roots[archive_id]; // We will copy this tree into our pool later
+    }
+    
+    // Primitive Mutation: If archive is empty, or randomly (10% chance), synthesize completely random shallow tree
+    state = state * 1664525 + 1013904223;
+    bool random_gen = (archive_size == 0 || (state % 100 < 10));
+
+    int new_root = -1;
+
+    if (random_gen || p1_idx == -1) {
+        // Build a random APP(CONST, CONST) or just CONST
+        state = state * 1664525 + 1013904223;
+        int action = state % 3;
+        
+        if (action == 0) {
+            // N_CONST
+            state = state * 1664525 + 1013904223;
+            int cid = state % 40; // Pick a random const from environment (0..40 roughly)
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, cid, 0, 0, new_root);
+        } 
+        else if (action == 1) {
+            // N_APP(CONST, CONST)
+            state = state * 1664525 + 1013904223;
+            int f_cid = state % 40;
+            state = state * 1664525 + 1013904223;
+            int x_cid = state % 40;
+            
+            int64_t f_node, x_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, f_cid, 0, 0, f_node);
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, x_cid, 0, 0, x_node);
+            ALLOC_NODE_HASH_CONS(N_APP, f_node, x_node, -1, 0, 0, 0, new_root);
+        }
+        else {
+            // N_LAM(body, dom) -> simplified
+            state = state * 1664525 + 1013904223;
+            int dom_cid = state % 4; // Nat or Bool
+            int64_t dom_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, dom_cid, 0, 0, dom_node);
+            
+            int64_t var_node;
+            ALLOC_NODE_HASH_CONS(N_VAR, 0, 0, -1, 0, 0, 0, var_node); // bvar 0
+            
+            ALLOC_NODE_HASH_CONS(N_LAM, var_node, dom_node, -1, 0, 0, 0, new_root);
+        }
+    } 
+    else {
+        // Crossover/Mutate from Parent
+        // Phase 10: Deep copy p1_idx into current pool. 
+        // For this prototype, we'll just attempt an application of parent to a random const.
+        int64_t p1_local_root = p1_idx; // Actually requires deep copy into base+pool_ptr if it was in another block's memory, 
+                                        // but if archive is just indices in our block (batch generation), we copy.
+                                        // To simplify, we assume the whole batch is generating from scratch initially.
+                                        // Real crossover will copy tree structures.
+        
+        state = state * 1664525 + 1013904223;
+        int action = state % 2;
+        
+        if (action == 0) {
+            // Apply to something
+            state = state * 1664525 + 1013904223;
+            int x_cid = state % 40;
+            int64_t x_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, x_cid, 0, 0, x_node);
+            ALLOC_NODE_HASH_CONS(N_APP, p1_local_root, x_node, -1, 0, 0, 0, new_root);
+        } else {
+            // Abstract it (Lam)
+            int64_t dom_node = 2; // Nat
+            ALLOC_NODE_HASH_CONS(N_LAM, p1_local_root, dom_node, -1, 0, 0, 0, new_root);
+        }
+    }
+
+    if (new_root == -1) {
+        // Fallback to CONST Nat
+        new_root = 2; 
+    }
+
+    root_indices[bi] = new_root;
+}
+
+
+// ============================================================
 // KERNEL: Extract results
 // ============================================================
 
@@ -1113,6 +1229,41 @@ std::vector<torch::Tensor> cic_engine_search(
 }
 
 
+// ============================================================
+// HOST: MAP-Elites Evolution Pipeline (Phase 10)
+// ============================================================
+
+std::vector<torch::Tensor> cic_engine_mutate(
+    torch::Tensor node_types, torch::Tensor child1, torch::Tensor child2,
+    torch::Tensor child3, torch::Tensor aux1, torch::Tensor aux2,
+    torch::Tensor levels, torch::Tensor root_indices,
+    torch::Tensor pi_lookup, torch::Tensor const_types,
+    torch::Tensor def_types, torch::Tensor ctor_tags, torch::Tensor rec_rules,
+    torch::Tensor archive_roots, int archive_size, int max_level, int seed
+) {
+    int B = node_types.size(0);
+    int MN = node_types.size(1);
+
+    int threads = 256;
+    int blocks = (B + threads - 1) / threads;
+
+    // Mutate trees
+    engine_mutate_kernel<<<blocks, threads>>>(
+        node_types.data_ptr<int64_t>(), child1.data_ptr<int64_t>(),
+        child2.data_ptr<int64_t>(), child3.data_ptr<int64_t>(),
+        aux1.data_ptr<int64_t>(), aux2.data_ptr<int64_t>(),
+        levels.data_ptr<int64_t>(), root_indices.data_ptr<int64_t>(),
+        archive_roots.data_ptr<int64_t>(), archive_size, B, MN, seed
+    );
+
+    // After mutation, run the standard type checker to verify the new ASTs
+    return cic_engine_pipeline(
+        node_types, child1, child2, child3, aux1, aux2,
+        levels, root_indices, pi_lookup, const_types,
+        def_types, ctor_tags, rec_rules, max_level
+    );
+}
+
 // Also expose backward-compatible cic_gpu_type_check
 std::vector<torch::Tensor> cic_gpu_type_check(
     torch::Tensor node_types, torch::Tensor child1, torch::Tensor child2,
@@ -1136,6 +1287,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Unified CIC engine: WHNF + TypeCheck with proper substitution");
     m.def("cic_engine_search", &cic_engine_search,
           "Phase 9.3: Autonomous MCTS Search Engine");
+    m.def("cic_engine_mutate", &cic_engine_mutate,
+          "Phase 10: Evolutionary AST Mutator");
     m.def("cic_gpu_type_check", &cic_gpu_type_check,
           "Backward-compatible type check interface");
 }
