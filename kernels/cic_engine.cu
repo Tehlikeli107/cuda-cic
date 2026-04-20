@@ -95,6 +95,111 @@ __device__ inline int64_t imax_level(int64_t u, int64_t v) {
 
 
 // ============================================================
+// DEVICE: Out-of-place Substitution (Allocating new nodes)
+// Used for Dependent Type Checking (e.g., Pi(x:A, B) a -> B[x:=a])
+// Recursive traversal simulating Deep Copy with Hash-Consing
+// ============================================================
+
+__device__ void subst_alloc_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    int root_idx, int var_depth, int replacement_idx,
+    int base, int MN, int* pool_ptr, int64_t* out_idx
+) {
+    if (root_idx < 0 || root_idx >= MN) {
+        *out_idx = root_idx;
+        return;
+    }
+
+    int64_t ntype = node_types[base + root_idx];
+
+    // If it's the exact bound variable we want to substitute
+    if (ntype == N_VAR && aux1[base + root_idx] == var_depth) {
+        *out_idx = replacement_idx;
+        return;
+    }
+    
+    // If it's a bound variable but a deeper one, we might need to shift it down 
+    // (de Bruijn shifting), but typically for simple substitution `B[x:=a]` we just leave it alone
+    // or decrement if `B` was under a binder that we just removed.
+    // For pure Types as Terms instantiation we ignore shifting in this simplified Phase 8 step.
+    if (ntype == N_VAR || ntype == N_CONST || ntype == N_SORT || ntype == N_NATLIT ||
+        ntype == N_NAT_ZERO || ntype == N_BOOL_TRUE || ntype == N_BOOL_FALSE || ntype == N_STRLIT) {
+        *out_idx = root_idx; // Leaf nodes: just point to them (Structural Sharing)
+        return;
+    }
+
+    // It's a compound node. We must recursively substitute into its children.
+    // GPU limitation: No true recursion. We should ideally use an explicit stack, 
+    // but for simplicity in types (which are usually small ASTs), we can simulate.
+    // To avoid stack overflows in CUDA, we do a bounded iterative copy or limited recursion.
+    // For Phase 8.3 we use a macro-like iterative approach.
+
+    int64_t c1 = child1[base + root_idx];
+    int64_t c2 = child2[base + root_idx];
+    int64_t c3 = child3[base + root_idx];
+    
+    int64_t new_c1 = c1;
+    int64_t new_c2 = c2;
+    int64_t new_c3 = c3;
+
+    int new_depth = var_depth + ((ntype == N_LAM || ntype == N_PI || ntype == N_LET) ? 1 : 0);
+
+    // Extremely shallow recursive call (CUDA compiler usually inlines this if depth is small)
+    // In production, this MUST be flattened to a WorkStack like in WHNF.
+    if (c1 >= 0 && c1 < MN) {
+        subst_alloc_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                        c1, new_depth, replacement_idx, base, MN, pool_ptr, &new_c1);
+    }
+    if (c2 >= 0 && c2 < MN) {
+        subst_alloc_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                        c2, (ntype == N_LET ? new_depth : var_depth), replacement_idx, base, MN, pool_ptr, &new_c2);
+    }
+    if (c3 >= 0 && c3 < MN) {
+        subst_alloc_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                        c3, new_depth, replacement_idx, base, MN, pool_ptr, &new_c3);
+    }
+
+    // If nothing changed, return original (Structural Sharing)
+    if (new_c1 == c1 && new_c2 == c2 && new_c3 == c3) {
+        *out_idx = root_idx;
+        return;
+    }
+
+    // Something changed. Allocate a new node via Hash-Consing.
+    int found = -1;
+    for (int i = MN - 1; i > *pool_ptr; i--) {
+        if (node_types[base + i] == ntype &&
+            child1[base + i] == new_c1 &&
+            child2[base + i] == new_c2 &&
+            child3[base + i] == new_c3 &&
+            aux1[base + i] == aux1[base + root_idx] &&
+            aux2[base + i] == aux2[base + root_idx] &&
+            levels[base + i] == levels[base + root_idx]) {
+            found = i;
+            break;
+        }
+    }
+
+    if (found != -1) {
+        *out_idx = found;
+    } else if (*pool_ptr >= 0) {
+        int idx = *pool_ptr;
+        node_types[base + idx] = ntype;
+        child1[base + idx] = new_c1;
+        child2[base + idx] = new_c2;
+        child3[base + idx] = new_c3;
+        aux1[base + idx] = aux1[base + root_idx];
+        aux2[base + idx] = aux2[base + root_idx];
+        levels[base + idx] = levels[base + root_idx];
+        (*pool_ptr)--;
+        *out_idx = idx;
+    } else {
+        *out_idx = -1; // Out of Memory
+    }
+}
+
+// ============================================================
 // DEVICE: In-place de Bruijn substitution (from cic_subst.cu)
 // ============================================================
 
@@ -196,9 +301,24 @@ __global__ void engine_whnf_kernel(
     // (MN - 1'den aşağıya doğru) bir pool kullanacağız.
     int pool_ptr = MN - 1;
 
-    // Macro for fast thread-local allocation of a new node from the back of the MN chunk
-    #define ALLOC_NODE(kind, c1, c2, c3, a1, a2, lvl) do { \
-        if (pool_ptr >= 0 && node_types[base + pool_ptr] == N_NONE) { \
+    // Macro for fast thread-local allocation with Linear-Scan Hash-Consing (Deduplication)
+    #define ALLOC_NODE_HASH_CONS(kind, c1, c2, c3, a1, a2, lvl, out_idx) do { \
+        int found = -1; \
+        for (int i = MN - 1; i > pool_ptr; i--) { \
+            if (node_types[base + i] == (kind) && \
+                child1[base + i] == (c1) && \
+                child2[base + i] == (c2) && \
+                child3[base + i] == (c3) && \
+                aux1[base + i] == (a1) && \
+                aux2[base + i] == (a2) && \
+                levels[base + i] == (lvl)) { \
+                found = i; \
+                break; \
+            } \
+        } \
+        if (found != -1) { \
+            (out_idx) = found; \
+        } else if (pool_ptr >= 0) { \
             node_types[base + pool_ptr] = (kind); \
             child1[base + pool_ptr] = (c1); \
             child2[base + pool_ptr] = (c2); \
@@ -206,8 +326,11 @@ __global__ void engine_whnf_kernel(
             aux1[base + pool_ptr] = (a1); \
             aux2[base + pool_ptr] = (a2); \
             levels[base + pool_ptr] = (lvl); \
+            (out_idx) = pool_ptr; \
+            pool_ptr--; \
+        } else { \
+            (out_idx) = -1; \
         } \
-        pool_ptr--; \
     } while(0)
 
     for (int step = 0; step < MAX_WHNF_STEPS; step++) {
@@ -293,16 +416,16 @@ __global__ void engine_whnf_kernel(
                             int64_t app_step_idx = child1[base + root];
                             
                             // 1. Allocate: App(app_step_idx, n_idx)  == (Nat.rec motive base step n)
-                            ALLOC_NODE(N_APP, app_step_idx, n_idx, -1, 0, 0, 0);
-                            int64_t rec_call_idx = pool_ptr + 1;
+                            int64_t rec_call_idx;
+                            ALLOC_NODE_HASH_CONS(N_APP, app_step_idx, n_idx, -1, 0, 0, 0, rec_call_idx);
                             
                             // 2. Allocate: App(step_idx, n_idx) == step n
-                            ALLOC_NODE(N_APP, step_idx, n_idx, -1, 0, 0, 0);
-                            int64_t step_n_idx = pool_ptr + 1;
+                            int64_t step_n_idx;
+                            ALLOC_NODE_HASH_CONS(N_APP, step_idx, n_idx, -1, 0, 0, 0, step_n_idx);
                             
                             // 3. Allocate: App(step_n_idx, rec_call_idx) == step n (Nat.rec motive base step n)
-                            ALLOC_NODE(N_APP, step_n_idx, rec_call_idx, -1, 0, 0, 0);
-                            int64_t final_app_idx = pool_ptr + 1;
+                            int64_t final_app_idx;
+                            ALLOC_NODE_HASH_CONS(N_APP, step_n_idx, rec_call_idx, -1, 0, 0, 0, final_app_idx);
                             
                             if (final_app_idx >= 0) {
                                 root = final_app_idx;
@@ -378,153 +501,157 @@ __global__ void engine_whnf_kernel(
 
 
 // ============================================================
-// KERNEL: Unified Type Checking (level-by-level)
+// KERNEL: Unified Type Checking (Term-Parallel)
 // ============================================================
 
 __global__ void engine_type_check_kernel(
-    const int64_t* __restrict__ node_types,
-    const int64_t* __restrict__ child1,
-    const int64_t* __restrict__ child2,
-    const int64_t* __restrict__ child3,
-    const int64_t* __restrict__ aux1,
-    const int64_t* __restrict__ aux2,
-    const int64_t* __restrict__ levels,
+    int64_t* __restrict__ node_types,
+    int64_t* __restrict__ child1,
+    int64_t* __restrict__ child2,
+    int64_t* __restrict__ child3,
+    int64_t* __restrict__ aux1,
+    int64_t* __restrict__ aux2,
+    int64_t* __restrict__ levels,
     int64_t* __restrict__ result,
     int64_t* __restrict__ pi_lookup,
     const int64_t* __restrict__ const_types,
     int target_level, int B, int MN
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * MN) return;
-    if (levels[idx] != target_level) return;
+    // Term-Parallel execution: One thread per Proof Term (bi)
+    int bi = blockIdx.x * blockDim.x + threadIdx.x;
+    if (bi >= B) return;
 
-    int bi = idx / MN;
-    int64_t ntype = node_types[idx];
-    if (ntype == N_NONE) return;
+    int base = bi * MN;
 
-    int64_t c1 = child1[idx], c2 = child2[idx], c3 = child3[idx];
-    int64_t a1 = aux1[idx], a2 = aux2[idx];
+    // Track the end of the term for local allocations (e.g. Dependent Pattern Matching substitution)
+    int pool_ptr = MN - 1;
 
-    int64_t ct1 = T_ERROR, ct2 = T_ERROR, ct3 = T_ERROR;
-    if (c1 >= 0 && c1 < MN) ct1 = result[bi * MN + c1];
-    if (c2 >= 0 && c2 < MN) ct2 = result[bi * MN + c2];
-    if (c3 >= 0 && c3 < MN) ct3 = result[bi * MN + c3];
+    // Process ALL nodes of the current target_level belonging to this proof term (bi)
+    for (int ni = 0; ni < MN; ni++) {
+        if (levels[base + ni] != target_level) continue;
 
-    int64_t res = T_ERROR;
+        int64_t ntype = node_types[base + ni];
+        if (ntype == N_NONE) continue;
 
-    switch (ntype) {
-        case N_SORT:
-            res = sort_of_sort(a1);
-            break;
+        int64_t c1 = child1[base + ni], c2 = child2[base + ni], c3 = child3[base + ni];
+        int64_t a1 = aux1[base + ni], a2 = aux2[base + ni];
 
-        case N_VAR:
-            // a2 = resolved type from binding context (set by Python flattener)
-            // a1 = de Bruijn index (used for substitution, not type inference)
-            res = (a2 != 0) ? a2 : a1;  // prefer resolved type, fall back to a1
-            break;
+        int64_t ct1 = T_ERROR, ct2 = T_ERROR, ct3 = T_ERROR;
+        if (c1 >= 0 && c1 < MN) ct1 = result[base + c1];
+        if (c2 >= 0 && c2 < MN) ct2 = result[base + c2];
+        if (c3 >= 0 && c3 < MN) ct3 = result[base + c3];
 
-        case N_CONST:
-            if (a1 >= 0 && a1 < MAX_CONSTS)
-                res = const_types[a1];
-            break;
+        int64_t res = T_ERROR;
 
-        case N_NATLIT:
-        case N_NAT_ZERO:
-            res = T_NAT;
-            break;
+        switch (ntype) {
+            case N_SORT:
+                res = sort_of_sort(a1);
+                break;
 
-        case N_NAT_SUCC:
-            res = (ct1 == T_NAT) ? T_NAT : T_ERROR;
-            break;
+            case N_VAR:
+                res = (a2 != 0) ? a2 : a1;
+                break;
 
-        case N_BOOL_TRUE:
-        case N_BOOL_FALSE:
-            res = T_BOOL;
-            break;
+            case N_CONST:
+                if (a1 >= 0 && a1 < MAX_CONSTS)
+                    res = const_types[a1];
+                break;
 
-        case N_STRLIT:
-            res = T_STRING;
-            break;
+            case N_NATLIT:
+            case N_NAT_ZERO:
+                res = T_NAT;
+                break;
 
-        case N_LAM: {
-            // fun (x : A) => body  : Pi(A, B) where B = type of body
-            // child1 = body, child2 = domain type
-            int64_t body_type = ct1;
-            int64_t dom_type = ct2;
+            case N_NAT_SUCC:
+                res = (ct1 == T_NAT) ? T_NAT : T_ERROR;
+                break;
 
-            // If domain is a type (e.g., CONST Nat : Type), use the type itself
-            // If domain is a value type, hash it
-            int64_t dom = (dom_type == T_TYPE && c2 >= 0 && c2 < MN) ?
-                          const_types[aux1[bi * MN + c2]] : dom_type;
-            // Fallback: if domain child is a known type constant
-            if (c2 >= 0 && c2 < MN && node_types[bi * MN + c2] == N_CONST) {
-                int64_t cid = aux1[bi * MN + c2];
-                if (cid >= 0 && cid < MAX_CONSTS) {
-                    int64_t ct = const_types[cid];
-                    if (ct == T_TYPE) {
-                        // This constant IS a type (e.g., Nat : Type)
-                        // The domain type hash should be the constant's "value as type"
-                        // For Nat, this is T_NAT; for Bool, T_BOOL
-                        if (cid == 0) dom = T_NAT;       // Nat
-                        else if (cid == 1) dom = T_BOOL;  // Bool
-                        else dom = ct;
+            case N_BOOL_TRUE:
+            case N_BOOL_FALSE:
+                res = T_BOOL;
+                break;
+
+            case N_STRLIT:
+                res = T_STRING;
+                break;
+
+            case N_LAM: {
+                int64_t body_type = ct1;
+                int64_t dom_type = ct2;
+
+                int64_t dom = (dom_type == T_TYPE && c2 >= 0 && c2 < MN) ?
+                              const_types[aux1[base + c2]] : dom_type;
+                if (c2 >= 0 && c2 < MN && node_types[base + c2] == N_CONST) {
+                    int64_t cid = aux1[base + c2];
+                    if (cid >= 0 && cid < MAX_CONSTS) {
+                        int64_t ct = const_types[cid];
+                        if (ct == T_TYPE) {
+                            if (cid == 0) dom = T_NAT;       // Nat
+                            else if (cid == 1) dom = T_BOOL;  // Bool
+                            else dom = ct;
+                        }
                     }
                 }
-            }
 
-            if (dom != T_ERROR && body_type != T_ERROR) {
-                int64_t h = pi_hash(dom, body_type);
-                if (h >= 0 && h < TABLE_SIZE) {
-                    atomicExch((unsigned long long*)&pi_lookup[h*2],
-                              (unsigned long long)dom);
-                    atomicExch((unsigned long long*)&pi_lookup[h*2+1],
-                              (unsigned long long)body_type);
+                if (dom != T_ERROR && body_type != T_ERROR) {
+                    int64_t h = pi_hash(dom, body_type);
+                    if (h >= 0 && h < TABLE_SIZE) {
+                        // Safe to use non-atomic since thread owns its pi_lookup portion, 
+                        // but since pi_lookup is global across all terms right now we keep atomicExch.
+                        atomicExch((unsigned long long*)&pi_lookup[h*2],
+                                  (unsigned long long)dom);
+                        atomicExch((unsigned long long*)&pi_lookup[h*2+1],
+                                  (unsigned long long)body_type);
+                    }
+                    res = h;
                 }
-                res = h;
+                break;
             }
-            break;
-        }
 
-        case N_PI: {
-            // Pi(A, B) : Sort(imax(level_of_A, level_of_B))
-            int64_t l1 = a1, l2 = a2;
-            res = sort_hash(imax_level(l1, l2));
-            break;
-        }
+            case N_PI: {
+                int64_t l1 = a1, l2 = a2;
+                res = sort_hash(imax_level(l1, l2));
+                break;
+            }
 
-        case N_APP: {
-            // f a : B  where f : Pi(A, B) and a : A
-            int64_t func_type = ct1;
-            int64_t arg_type = ct2;
+            case N_APP: {
+                int64_t func_type = ct1;
+                int64_t arg_type = ct2;
 
-            if (func_type > 0 && func_type < TABLE_SIZE) {
-                int64_t dom = pi_lookup[func_type * 2];
-                int64_t cod = pi_lookup[func_type * 2 + 1];
-                if (dom != 0 && dom == arg_type) {
-                    res = cod;
+                if (func_type > 0 && func_type < TABLE_SIZE) {
+                    int64_t dom = pi_lookup[func_type * 2];
+                    int64_t cod = pi_lookup[func_type * 2 + 1];
+                    if (dom != 0 && dom == arg_type) {
+                        // Phase 8.3 TODO: Return a new AST node created by substitution (cod[x:=arg])
+                        // For fully dependent types (Types as Terms), `cod` should be an AST node.
+                        // Since `cod` here is currently a hash, we pass it through.
+                        // In the future:
+                        // int64_t new_cod;
+                        // subst_alloc_dev(cod_ast_idx, 0, c2, &new_cod); 
+                        // res = new_cod;
+                        res = cod;
+                    }
                 }
+                break;
             }
-            break;
+
+            case N_LET:
+                res = ct3;
+                break;
+
+            case N_CTOR: {
+                res = a2;
+                break;
+            }
+
+            case N_REC: {
+                if (ct1 != T_ERROR) res = ct1;
+                break;
+            }
         }
 
-        case N_LET:
-            res = ct3;  // body type
-            break;
-
-        case N_CTOR: {
-            // Constructor: a2 = pre-registered result type
-            res = a2;
-            break;
-        }
-
-        case N_REC: {
-            // Recursor: base case type = result type for constant motive
-            if (ct1 != T_ERROR) res = ct1;
-            break;
-        }
+        result[base + ni] = res;
     }
-
-    result[idx] = res;
 }
 
 
@@ -582,8 +709,9 @@ std::vector<torch::Tensor> cic_engine_pipeline(
         B, MN
     );
 
-    // Phase 2: Type checking (level by level)
-    int tc_blocks = (B * MN + threads - 1) / threads;
+    // Phase 2: Type checking (level by level, Term-Parallel)
+    // We launch 1 thread per proof term, not 1 thread per node.
+    int tc_blocks = (B + threads - 1) / threads;
     for (int lv = 0; lv <= max_level; lv++) {
         engine_type_check_kernel<<<tc_blocks, threads>>>(
             node_types.data_ptr<int64_t>(), child1.data_ptr<int64_t>(),
