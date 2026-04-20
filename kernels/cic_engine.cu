@@ -663,10 +663,11 @@ __global__ void engine_whnf_kernel(
     int base = bi * MN;
     int64_t root = root_indices[bi];
     int steps = 0;
-    int pool_ptr = MN - 1;
+    int pool_ptr_val = MN - 1;
+    int* pool_ptr = &pool_ptr_val;
 
     root = whnf_single_dev(node_types, child1, child2, child3, aux1, aux2, levels,
-                           def_types, ctor_tags, rec_rules, root, base, MN, &pool_ptr, &steps);
+                           def_types, ctor_tags, rec_rules, root, base, MN, pool_ptr, &steps);
 
     root_indices[bi] = root;
     whnf_steps[bi] = steps;
@@ -703,7 +704,8 @@ __global__ void engine_type_check_kernel(
     __syncthreads();
 
     // Track the end of the term for local allocations (e.g. Dependent Pattern Matching substitution)
-    int pool_ptr = MN - 1;
+    int pool_ptr_val = MN - 1;
+    int* pool_ptr = &pool_ptr_val;
 
     // Process ALL nodes of the current target_level belonging to this proof term (bi)
     for (int ni = 0; ni < MN; ni++) {
@@ -724,7 +726,16 @@ __global__ void engine_type_check_kernel(
 
         switch (ntype) {
             case N_SORT:
-                res = sort_of_sort(a1);
+                res = (a1 == 0) ? 1 : ((a1 == 1) ? 2 /* T_TYPE1 missing, fallback to 1 for now if deeper */ : 1);
+                // Phase 8.7: AST index returning
+                // if a1 == 0 (Sort 0 / Prop), return Sort 1 (Type) -> which is pre-allocated at index 1!
+                // if a1 == 1 (Sort 1 / Type), return Sort 2 (Type 1) -> we need to handle this.
+                if (a1 == 0) res = 1; // Index of SORT 1
+                else if (a1 == 1) {
+                    int64_t type_idx;
+                    ALLOC_NODE_HASH_CONS(N_SORT, -1, -1, -1, a1 + 1, 0, target_level, type_idx);
+                    res = type_idx;
+                }
                 break;
 
             case N_VAR:
@@ -732,64 +743,44 @@ __global__ void engine_type_check_kernel(
                 break;
 
             case N_CONST:
-                if (a1 >= 0 && a1 < MAX_CONSTS)
+                if (a1 >= 0 && a1 < MAX_CONSTS) {
+                    // Phase 8.7: Const types are now AST indices!
                     res = const_types[a1];
+                }
                 break;
 
             case N_NATLIT:
-            case N_NAT_ZERO:
-                res = T_NAT;
-                break;
-
-            case N_NAT_SUCC:
-                res = (ct1 == T_NAT) ? T_NAT : T_ERROR;
-                break;
-
-            case N_BOOL_TRUE:
-            case N_BOOL_FALSE:
-                res = T_BOOL;
+                res = 2; // Pre-allocated CONST Nat
                 break;
 
             case N_STRLIT:
-                res = T_STRING;
+                res = 4; // Pre-allocated CONST String
                 break;
 
             case N_LAM: {
                 int64_t body_type = ct1;
                 int64_t dom_type = ct2;
 
-                int64_t dom = (dom_type == T_TYPE && c2 >= 0 && c2 < MN) ?
-                              const_types[aux1[base + c2]] : dom_type;
-                if (c2 >= 0 && c2 < MN && node_types[base + c2] == N_CONST) {
-                    int64_t cid = aux1[base + c2];
-                    if (cid >= 0 && cid < MAX_CONSTS) {
-                        int64_t ct = const_types[cid];
-                        if (ct == T_TYPE) {
-                            if (cid == 0) dom = T_NAT;       // Nat
-                            else if (cid == 1) dom = T_BOOL;  // Bool
-                            else dom = ct;
-                        }
-                    }
-                }
+                // Phase 8.7: Domain is now an AST index!
+                int64_t dom = dom_type;
 
                 if (dom != T_ERROR && body_type != T_ERROR) {
-                    int64_t h = pi_hash(dom, body_type);
-                    if (h >= 0 && h < TABLE_SIZE) {
-                        // Safe to use non-atomic since thread owns its pi_lookup portion, 
-                        // but since pi_lookup is global across all terms right now we keep atomicExch.
-                        atomicExch((unsigned long long*)&pi_lookup[h*2],
-                                  (unsigned long long)dom);
-                        atomicExch((unsigned long long*)&pi_lookup[h*2+1],
-                                  (unsigned long long)body_type);
-                    }
-                    res = h;
+                    // Return Pi(dom, body_type)
+                    int64_t pi_idx;
+                    ALLOC_NODE_HASH_CONS(N_PI, dom, body_type, -1, 0, 0, target_level, pi_idx);
+                    res = pi_idx;
                 }
                 break;
             }
 
             case N_PI: {
-                int64_t l1 = a1, l2 = a2;
-                res = sort_hash(imax_level(l1, l2));
+                // Rule: Sort(imax(u, v))
+                int64_t l1 = levels[base + ct1]; // Phase 8.7 levels of the domain AST
+                int64_t l2 = levels[base + ct2];
+                // Simplified for now: just return Sort(imax(0, 0)) -> Prop (0)
+                int64_t sort_idx;
+                ALLOC_NODE_HASH_CONS(N_SORT, -1, -1, -1, 0, 0, target_level, sort_idx);
+                res = sort_idx;
                 break;
             }
 
@@ -797,43 +788,24 @@ __global__ void engine_type_check_kernel(
                 int64_t func_type = ct1;
                 int64_t arg_type = ct2;
 
-                if (func_type > 0 && func_type < TABLE_SIZE) {
-                    int64_t dom = pi_lookup[func_type * 2];
-                    int64_t cod = pi_lookup[func_type * 2 + 1];
+                if (func_type >= 0 && func_type < MN && node_types[base + func_type] == N_PI) {
+                    int64_t dom = child1[base + func_type];
+                    int64_t cod = child2[base + func_type];
                     
-                    if (dom != 0) {
-                        // Phase 8.6: Use the new unify_dev (Cooperative Metavariable Engine)
-                        // Note: For now dom and arg_type are integer hashes, but as we migrate fully
-                        // to Types as Terms, these will be AST indices. Unify handles hash-consed nodes natively.
-                        bool type_match = false;
-                        if (dom == arg_type) {
-                            type_match = true;
-                        } else {
-                            // PHASE 8.6 WARNING: `dom` and `arg_type` are currently 64-bit integer HASHES 
-                            // (e.g. T_NAT=10, or pi_hash results), NOT AST indices!
-                            // Passing them as `root_a` and `root_b` to `unify_dev` causes an immediate Out-Of-Bounds
-                            // memory access (Segfault) because it tries to read node_types[base + hash_value].
-                            // True Types-as-Terms unification requires the Environment to return AST indices, not Hashes.
-                            // For now, if the hash doesn't match exactly, we fail safely instead of crashing the GPU.
-                            
-                            type_match = false; 
-                            
-                            /* Future implementation when dom and arg_type are guaranteed to be AST node indices:
-                            type_match = unify_dev(
-                                node_types, child1, child2, child3, aux1, aux2, levels,
-                                nullptr, nullptr, nullptr,
-                                (int)dom, (int)arg_type, base, MN, &pool_ptr,
-                                mvar_env, 64
-                            );
-                            */
-                        }
+                    if (dom >= 0) {
+                        bool type_match = unify_dev(
+                            node_types, child1, child2, child3, aux1, aux2, levels,
+                            nullptr, nullptr, nullptr,
+                            (int)dom, (int)arg_type, base, MN, pool_ptr,
+                            mvar_env, 64
+                        );
                         
                         if (type_match) {
-                            // Phase 8.3 TODO: Return a new AST node created by substitution (cod[x:=arg])
-                            // int64_t new_cod;
-                            // subst_alloc_dev(cod_ast_idx, 0, c2, &new_cod); 
-                            // res = new_cod;
-                            res = cod;
+                            // Phase 8.7 Substitution: B[x:=a]
+                            int64_t new_cod;
+                            subst_alloc_dev(node_types, child1, child2, child3, aux1, aux2, levels,
+                                            cod, 0, arg_type, base, MN, pool_ptr, &new_cod);
+                            res = new_cod;
                         }
                     }
                 }
@@ -845,6 +817,8 @@ __global__ void engine_type_check_kernel(
                 break;
 
             case N_CTOR: {
+                // Phase 8.7: Constructor result type should be computed from the inductive type definition.
+                // For now, it's fetched from Python pre-computation via a2 (if we passed the AST index).
                 res = a2;
                 break;
             }

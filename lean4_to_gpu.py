@@ -253,7 +253,22 @@ def flatten_tree_v2(tree: ExprNode, env: CICEnvironment) -> Tuple[List[Tuple], i
       N_SORT:  a1 = universe level (0=Prop, 1=Type, 2=Type1)
       N_NATLIT: a1 = value
     """
-    nodes: List[Tuple] = []
+    
+    # PHASE 8.7: The Great Hash Annihilation
+    # We must pre-allocate the foundational primitives as actual AST nodes at fixed indices.
+    # [0] SORT 0 (Prop)
+    # [1] SORT 1 (Type)
+    # [2] CONST Nat
+    # [3] CONST Bool
+    # [4] CONST String
+    
+    nodes: List[Tuple] = [
+        (N_SORT, -1, -1, -1, 0, 0, 0),                            # 0: Prop
+        (N_SORT, -1, -1, -1, 1, 0, 0),                            # 1: Type
+        (N_CONST, -1, -1, -1, env.get_or_create("Nat"), 0, 0),    # 2: Nat
+        (N_CONST, -1, -1, -1, env.get_or_create("Bool"), 0, 0),   # 3: Bool
+        (N_CONST, -1, -1, -1, env.get_or_create("String"), 0, 0), # 4: String
+    ]
     level_cache: Dict[int, int] = {}
     ctx = BindingContext()
 
