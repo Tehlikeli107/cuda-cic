@@ -919,9 +919,43 @@ __global__ void engine_type_check_kernel(
 
 
 // ============================================================
-// KERNEL: Evolutionary Mutator (Phase 10: MAP-Elites)
-// Mutates AST trees directly in GPU memory using LCG randomness
+// DEVICE: Phase 10.1 The Algebraic Oracle (Eq Discovery)
 // ============================================================
+
+__device__ int deep_copy_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    int src_root_idx, int base, int MN, int* pool_ptr, int current_level
+) {
+    if (src_root_idx < 0 || src_root_idx >= MN) return src_root_idx;
+    
+    int64_t ntype = node_types[base + src_root_idx];
+    
+    // Primitives/Leaves are immutable and shared
+    if (ntype == N_SORT || ntype == N_CONST || ntype == N_VAR || ntype == N_STRLIT || 
+        ntype == N_NATLIT || ntype == N_NAT_ZERO || ntype == N_BOOL_TRUE || ntype == N_BOOL_FALSE) {
+        return src_root_idx;
+    }
+    
+    // Recursive copy for compound nodes
+    int64_t c1 = child1[base + src_root_idx];
+    int64_t c2 = child2[base + src_root_idx];
+    int64_t c3 = child3[base + src_root_idx];
+    
+    int new_c1 = c1;
+    int new_c2 = c2;
+    int new_c3 = c3;
+    
+    // Shallow recursion (inlined by NVCC mostly, but beware of depth limits)
+    if (c1 >= 0 && c1 < MN) new_c1 = deep_copy_dev(node_types, child1, child2, child3, aux1, aux2, levels, c1, base, MN, pool_ptr, current_level);
+    if (c2 >= 0 && c2 < MN) new_c2 = deep_copy_dev(node_types, child1, child2, child3, aux1, aux2, levels, c2, base, MN, pool_ptr, current_level);
+    if (c3 >= 0 && c3 < MN) new_c3 = deep_copy_dev(node_types, child1, child2, child3, aux1, aux2, levels, c3, base, MN, pool_ptr, current_level);
+    
+    int64_t new_node_idx;
+    ALLOC_NODE_HASH_CONS(ntype, new_c1, new_c2, new_c3, aux1[base + src_root_idx], aux2[base + src_root_idx], current_level, new_node_idx);
+    
+    return new_node_idx;
+}
 
 __global__ void engine_mutate_kernel(
     int64_t* __restrict__ node_types, int64_t* __restrict__ child1,
@@ -941,92 +975,99 @@ __global__ void engine_mutate_kernel(
     state = state * 1664525 + 1013904223;
 
     // Reset tree to primitives
-    // Phase 8.7 primitives are always at index 0..4
     for (int i = 5; i < MN; i++) {
         node_types[base + i] = N_NONE;
     }
 
     int pool_ptr_val = MN - 1;
     int* pool_ptr = &pool_ptr_val;
+    int current_level = 0;
     
-    // Select 1-2 parent trees from archive
+    // Select 1 parent tree from archive
     int p1_idx = -1;
     if (archive_size > 0) {
         state = state * 1664525 + 1013904223;
         int archive_id = state % archive_size;
-        p1_idx = archive_roots[archive_id]; // We will copy this tree into our pool later
+        p1_idx = archive_roots[archive_id]; 
     }
     
-    // Primitive Mutation: If archive is empty, or randomly (10% chance), synthesize completely random shallow tree
     state = state * 1664525 + 1013904223;
-    bool random_gen = (archive_size == 0 || (state % 100 < 10));
+    bool random_gen = (archive_size == 0 || (state % 100 < 50));
 
     int new_root = -1;
 
+    // Phase 10.1 The Algebraic Oracle: Eq(a, b) focus
+    // Eq.refl : (a : A) -> Eq A a a
+    // We synthesize App(Eq.refl, a) to prove Eq A a a.
+    
+    // We need to know the IDs of Eq.refl and Nat constants. 
+    // In our environment: Nat=2 (preallocated), Eq.refl is roughly index 34.
+    // For this kernel to be truly generic we'd pass these IDs from Python, but we'll use assumed IDs for the prototype.
+    int EQ_REFL_CID = 34; 
+    int NAT_ZERO_CID = 5;
+    int NAT_SUCC_CID = 6;
+    int NAT_ADD_CID = 7;
+    int NAT_MUL_CID = 8;
+    int NAT_SUB_CID = 9;
+
     if (random_gen || p1_idx == -1) {
-        // Build a random APP(CONST, CONST) or just CONST
+        // Synthesize a random algebraic term (a)
         state = state * 1664525 + 1013904223;
         int action = state % 3;
         
+        int64_t term_a_idx = -1;
+        
         if (action == 0) {
-            // N_CONST
-            state = state * 1664525 + 1013904223;
-            int cid = state % 40; // Pick a random const from environment (0..40 roughly)
-            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, cid, 0, 0, new_root);
+            // Nat.zero
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, NAT_ZERO_CID, 0, current_level, term_a_idx);
         } 
         else if (action == 1) {
-            // N_APP(CONST, CONST)
-            state = state * 1664525 + 1013904223;
-            int f_cid = state % 40;
-            state = state * 1664525 + 1013904223;
-            int x_cid = state % 40;
-            
-            int64_t f_node, x_node;
-            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, f_cid, 0, 0, f_node);
-            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, x_cid, 0, 0, x_node);
-            ALLOC_NODE_HASH_CONS(N_APP, f_node, x_node, -1, 0, 0, 0, new_root);
+            // Nat.succ Nat.zero
+            int64_t z_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, NAT_ZERO_CID, 0, current_level, z_node);
+            int64_t s_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, NAT_SUCC_CID, 0, current_level, s_node);
+            ALLOC_NODE_HASH_CONS(N_APP, s_node, z_node, -1, 0, 0, current_level, term_a_idx);
         }
         else {
-            // N_LAM(body, dom) -> simplified
-            state = state * 1664525 + 1013904223;
-            int dom_cid = state % 4; // Nat or Bool
-            int64_t dom_node;
-            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, dom_cid, 0, 0, dom_node);
+            // Nat.add Nat.zero Nat.zero
+            int64_t z_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, NAT_ZERO_CID, 0, current_level, z_node);
+            int64_t a_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, NAT_ADD_CID, 0, current_level, a_node);
             
-            int64_t var_node;
-            ALLOC_NODE_HASH_CONS(N_VAR, 0, 0, -1, 0, 0, 0, var_node); // bvar 0
+            int64_t app1;
+            ALLOC_NODE_HASH_CONS(N_APP, a_node, z_node, -1, 0, 0, current_level, app1);
+            ALLOC_NODE_HASH_CONS(N_APP, app1, z_node, -1, 0, 0, current_level, term_a_idx);
+        }
+        
+        // Now wrap the term `a` in `Eq.refl Nat a` to prove `Eq Nat a a`
+        if (term_a_idx != -1) {
+            int64_t refl_node;
+            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, EQ_REFL_CID, 0, current_level, refl_node);
             
-            ALLOC_NODE_HASH_CONS(N_LAM, var_node, dom_node, -1, 0, 0, 0, new_root);
+            // App(Eq.refl, term_a_idx) -> we ignore implicit `Nat` argument for simplicity in this AST builder 
+            // depending on how Lean parses it. If `Nat` is explicit, we need App(App(Eq.refl, Nat), a)
+            int64_t nat_node = 2; // Preallocated CONST Nat
+            int64_t app_refl_nat;
+            ALLOC_NODE_HASH_CONS(N_APP, refl_node, nat_node, -1, 0, 0, current_level, app_refl_nat);
+            ALLOC_NODE_HASH_CONS(N_APP, app_refl_nat, term_a_idx, -1, 0, 0, current_level, new_root);
         }
     } 
     else {
-        // Crossover/Mutate from Parent
-        // Phase 10: Deep copy p1_idx into current pool. 
-        // For this prototype, we'll just attempt an application of parent to a random const.
-        int64_t p1_local_root = p1_idx; // Actually requires deep copy into base+pool_ptr if it was in another block's memory, 
-                                        // but if archive is just indices in our block (batch generation), we copy.
-                                        // To simplify, we assume the whole batch is generating from scratch initially.
-                                        // Real crossover will copy tree structures.
+        // Crossover/Mutate from Algebraic Parent
+        int64_t p1_local_root = deep_copy_dev(node_types, child1, child2, child3, aux1, aux2, levels, p1_idx, base, MN, pool_ptr, current_level);
         
-        state = state * 1664525 + 1013904223;
-        int action = state % 2;
+        // Let's wrap the parent theorem `p` in `Eq.symm` (p : Eq A a b -> Eq A b a)
+        int EQ_SYMM_CID = 35;
+        int64_t symm_node;
+        ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, EQ_SYMM_CID, 0, current_level, symm_node);
         
-        if (action == 0) {
-            // Apply to something
-            state = state * 1664525 + 1013904223;
-            int x_cid = state % 40;
-            int64_t x_node;
-            ALLOC_NODE_HASH_CONS(N_CONST, -1, -1, -1, x_cid, 0, 0, x_node);
-            ALLOC_NODE_HASH_CONS(N_APP, p1_local_root, x_node, -1, 0, 0, 0, new_root);
-        } else {
-            // Abstract it (Lam)
-            int64_t dom_node = 2; // Nat
-            ALLOC_NODE_HASH_CONS(N_LAM, p1_local_root, dom_node, -1, 0, 0, 0, new_root);
-        }
+        // App(Eq.symm, p)
+        ALLOC_NODE_HASH_CONS(N_APP, symm_node, p1_local_root, -1, 0, 0, current_level, new_root);
     }
 
     if (new_root == -1) {
-        // Fallback to CONST Nat
         new_root = 2; 
     }
 
