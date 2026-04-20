@@ -68,17 +68,26 @@ class CICEnvironment:
     """GPU-ready CIC constant environment.
 
     Manages the mapping from Lean4 constant names to GPU constant IDs
-    and their type hashes.
+    and their type hashes, as well as constructor tags and recursor rules
+    for fully generic IOTA reduction on GPU.
     """
 
     def __init__(self):
         self.name_to_id: Dict[str, int] = {}
         self.id_to_type: Dict[int, int] = {}
         self.id_to_name: Dict[int, str] = {}
+        self.id_to_tag: Dict[int, int] = {}    # cid -> constructor_tag (0, 1, 2...)
+        self.id_to_rule: Dict[int, int] = {}   # cid -> recursor_rule (bitpacked: params << 16 | minors)
         self.next_id: int = 0
         self.pi_types: List[Tuple[int, int]] = []  # (dom, cod) pairs to register
 
         self._register_core_constants()
+
+    def get_tag(self, cid: int) -> int:
+        return self.id_to_tag.get(cid, -1)
+        
+    def get_rule(self, cid: int) -> int:
+        return self.id_to_rule.get(cid, 0)
 
     def _register_core_constants(self):
         """Register the core Lean4 constants with known types."""
@@ -183,6 +192,20 @@ class CICEnvironment:
                 self.register(name, T_TYPE) # Assume Type
                 i += 1
                 
+                # Parse constructors for this inductive type
+                tag = 0
+                while i < len(lines) and not lines[i].startswith("==="):
+                    if lines[i].strip().startswith("--- CTORS"):
+                        i += 1
+                        while i < len(lines) and lines[i].strip().startswith("CTOR"):
+                            ctor_name = lines[i].strip().replace("CTOR ", "")
+                            cid = self.get_or_create(ctor_name)
+                            self.id_to_tag[cid] = tag
+                            tag += 1
+                            i += 1
+                    else:
+                        i += 1
+                        
             # CONSTRUCTOR name
             elif line.startswith("=== CONSTRUCTOR "):
                 name = line.replace("=== CONSTRUCTOR ", "").replace(" ===", "").strip()
@@ -219,6 +242,20 @@ class CICEnvironment:
             (T_TYPE, T_PROP),
             (T_BOOL, T_NAT),
         ]
+        
+        # Phase 7: Setup fully generic rules manually for core types (later from export)
+        # rec_rules = (n_params << 16) | n_minors
+        nat_rec_id = self.get_or_create("Nat.rec")
+        self.id_to_rule[nat_rec_id] = (0 << 16) | 2 # 0 params (just motive), 2 minors (zero, succ)
+        
+        bool_rec_id = self.get_or_create("Bool.rec")
+        self.id_to_rule[bool_rec_id] = (0 << 16) | 2 # 0 params, 2 minors (true, false)
+        
+        eq_rec_id = self.get_or_create("Eq.rec")
+        self.id_to_rule[eq_rec_id] = (2 << 16) | 1 # 2 params (type, a), 1 minor (refl)
+        
+        list_rec_id = self.get_or_create("List.rec")
+        self.id_to_rule[list_rec_id] = (1 << 16) | 2 # 1 param (Type), 2 minors (nil, cons)
 
     def register(self, name: str, type_hash: int) -> int:
         """Register a constant with a known type."""

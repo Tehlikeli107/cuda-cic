@@ -52,11 +52,7 @@ N_LET      = 6
 N_CTOR     = 7
 N_REC      = 8
 N_NATLIT   = 9
-N_NAT_ZERO = 10
-N_NAT_SUCC = 11
-N_BOOL_TRUE= 12
-N_BOOL_FALSE=13
-N_STRLIT   = 14
+N_STRLIT   = 10
 N_NONE     = -1
 
 
@@ -283,18 +279,10 @@ def flatten_tree_v2(tree: ExprNode, env: CICEnvironment) -> Tuple[List[Tuple], i
             idx = len(nodes)
             
             # Map specific constant names to GPU specialized node types
-            if name.endswith('.rec'):
+            if name.endswith('.rec') or env.get_rule(cid) != 0:
                 nodes.append((N_REC, -1, -1, -1, cid, 0, 0))
-            elif name.endswith('.zero') or name == 'Nat.zero':
-                nodes.append((N_NAT_ZERO, -1, -1, -1, cid, 0, 0))
-            elif name.endswith('.succ') or name == 'Nat.succ':
-                nodes.append((N_NAT_SUCC, -1, -1, -1, cid, 0, 0))
-            elif name.endswith('.true') or name == 'Bool.true':
-                nodes.append((N_BOOL_TRUE, -1, -1, -1, cid, 0, 0))
-            elif name.endswith('.false') or name == 'Bool.false':
-                nodes.append((N_BOOL_FALSE, -1, -1, -1, cid, 0, 0))
-            elif name.endswith('.nil') or name.endswith('.cons') or name.endswith('.mk'):
-                nodes.append((N_CTOR, -1, -1, -1, cid, 0, 0))
+            elif env.get_tag(cid) != -1:
+                nodes.append((N_CTOR, -1, -1, -1, cid, env.get_tag(cid), 0))
             else:
                 nodes.append((N_CONST, -1, -1, -1, cid, 0, 0))
             return idx
@@ -511,7 +499,18 @@ def build_gpu_batch(
         'const_types': torch.from_numpy(env.to_numpy()).to(DEVICE),
         'lookup': torch.from_numpy(env.build_lookup_array()).to(DEVICE),
         'def_values': torch.zeros(MAX_CONSTS, dtype=torch.long, device=DEVICE),
+        'ctor_tags': torch.full((MAX_CONSTS,), -1, dtype=torch.long, device=DEVICE),
+        'rec_rules': torch.zeros(MAX_CONSTS, dtype=torch.long, device=DEVICE)
     }
+
+    # Fill in ctor_tags and rec_rules from env
+    for cid, tag in env.id_to_tag.items():
+        if 0 <= cid < MAX_CONSTS:
+            tensors['ctor_tags'][cid] = tag
+
+    for cid, rule in env.id_to_rule.items():
+        if 0 <= cid < MAX_CONSTS:
+            tensors['rec_rules'][cid] = rule
 
     return tensors
 
@@ -599,6 +598,7 @@ def main():
         batch['node_types'], batch['child1'], batch['child2'], batch['child3'],
         batch['aux1'], batch['aux2'], batch['levels'], batch['roots'],
         batch['lookup'], batch['const_types'], batch['def_values'],
+        batch['ctor_tags'], batch['rec_rules'],
         batch['max_level']
     )
 
@@ -643,7 +643,8 @@ def main():
             big_batch['child3'], big_batch['aux1'], big_batch['aux2'],
             big_batch['levels'], big_batch['roots'],
             big_batch['lookup'], big_batch['const_types'],
-            big_batch['def_values'], big_batch['max_level']
+            big_batch['def_values'], big_batch['ctor_tags'], big_batch['rec_rules'],
+            big_batch['max_level']
         )
         torch.cuda.synchronize()
 
@@ -653,7 +654,8 @@ def main():
             big_batch['child3'], big_batch['aux1'], big_batch['aux2'],
             big_batch['levels'], big_batch['roots'],
             big_batch['lookup'], big_batch['const_types'],
-            big_batch['def_values'], big_batch['max_level']
+            big_batch['def_values'], big_batch['ctor_tags'], big_batch['rec_rules'],
+            big_batch['max_level']
         )
         ev_e.record()
         torch.cuda.synchronize()

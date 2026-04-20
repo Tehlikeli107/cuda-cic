@@ -680,12 +680,11 @@ __global__ void engine_extract_kernel(
 // ============================================================
 
 std::vector<torch::Tensor> cic_engine_pipeline(
-    torch::Tensor node_types, torch::Tensor child1,
-    torch::Tensor child2, torch::Tensor child3,
-    torch::Tensor aux1, torch::Tensor aux2,
+    torch::Tensor node_types, torch::Tensor child1, torch::Tensor child2,
+    torch::Tensor child3, torch::Tensor aux1, torch::Tensor aux2,
     torch::Tensor levels, torch::Tensor root_indices,
     torch::Tensor pi_lookup, torch::Tensor const_types,
-    torch::Tensor def_types,
+    torch::Tensor def_types, torch::Tensor ctor_tags, torch::Tensor rec_rules,
     int max_level
 ) {
     int B = node_types.size(0);
@@ -737,20 +736,19 @@ std::vector<torch::Tensor> cic_engine_pipeline(
 
 // Also expose backward-compatible cic_gpu_type_check
 std::vector<torch::Tensor> cic_gpu_type_check(
-    torch::Tensor node_types, torch::Tensor child1,
-    torch::Tensor child2, torch::Tensor child3,
-    torch::Tensor aux1, torch::Tensor aux2,
+    torch::Tensor node_types, torch::Tensor child1, torch::Tensor child2,
+    torch::Tensor child3, torch::Tensor aux1, torch::Tensor aux2,
     torch::Tensor levels, torch::Tensor root_indices,
     torch::Tensor pi_lookup, torch::Tensor const_types,
-    torch::Tensor def_values,
+    torch::Tensor def_types, torch::Tensor ctor_tags, torch::Tensor rec_rules,
     int max_level
 ) {
     auto results = cic_engine_pipeline(
         node_types, child1, child2, child3, aux1, aux2,
         levels, root_indices, pi_lookup, const_types,
-        def_values, max_level
+        def_types, ctor_tags, rec_rules, max_level
     );
-    return {results[0], results[1], results[2]};  // valid, root_types, result
+    return {results[0], results[1], results[2]};
 }
 
 
