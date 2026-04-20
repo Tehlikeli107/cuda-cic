@@ -674,6 +674,35 @@ __global__ void engine_whnf_kernel(
 }
 
 // ============================================================
+// DEVICE: Phase 9.1 Tactic Engine (Autonomous AST Synthesis)
+// ============================================================
+
+__device__ int tactic_apply_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    int func_ast_idx, int arg_ast_idx, int base, int MN, int* pool_ptr, int current_level
+) {
+    // Tactic 'apply': Takes a function and an argument, synthesizes an N_APP node on the GPU.
+    // Equivalent to AST: App(func, arg)
+    int64_t app_idx;
+    ALLOC_NODE_HASH_CONS(N_APP, func_ast_idx, arg_ast_idx, -1, 0, 0, current_level, app_idx);
+    return (int)app_idx;
+}
+
+__device__ int tactic_intro_dev(
+    int64_t* node_types, int64_t* child1, int64_t* child2,
+    int64_t* child3, int64_t* aux1, int64_t* aux2, int64_t* levels,
+    int dom_ast_idx, int body_ast_idx, int binder_info, int base, int MN, int* pool_ptr, int current_level
+) {
+    // Tactic 'intro': Synthesizes a Lambda (N_LAM) node on the GPU.
+    // Equivalent to AST: Lam(body, dom)
+    int64_t lam_idx;
+    ALLOC_NODE_HASH_CONS(N_LAM, body_ast_idx, dom_ast_idx, -1, binder_info, 0, current_level, lam_idx);
+    return (int)lam_idx;
+}
+
+
+// ============================================================
 // KERNEL: Unified Type Checking (Term-Parallel)
 // ============================================================
 
