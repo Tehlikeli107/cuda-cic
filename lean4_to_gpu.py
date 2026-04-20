@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.join(WORKDIR, 'lean4'))
 from env_builder import (
     CICEnvironment, TypeClassResolver, get_default_env,
     T_ERROR, T_PROP, T_TYPE, T_TYPE1, T_NAT, T_BOOL,
-    pi_hash, sort_hash, MAX_CONSTS, TABLE_SIZE,
+    pi_hash, sort_hash, MAX_CONSTS, TABLE_SIZE, HASH_MOD,
     NAT_NAT, NAT_NAT_NAT, NAT_PROP, NAT_NAT_PROP
 )
 
@@ -54,6 +54,9 @@ N_REC      = 8
 N_NATLIT   = 9
 N_NAT_ZERO = 10
 N_NAT_SUCC = 11
+N_BOOL_TRUE= 12
+N_BOOL_FALSE=13
+N_STRLIT   = 14
 N_NONE     = -1
 
 
@@ -107,6 +110,8 @@ def parse_tree(lines: List[str], start: int = 0) -> Tuple[Optional[ExprNode], in
 
     if kind == 'NATLIT':
         node.value = int(name_or_val) if name_or_val else 0
+    elif kind == 'STRLIT':
+        node.value = hash(name_or_val) % (2**31) if name_or_val else 0
     elif kind == 'BVAR':
         node.value = int(name_or_val) if name_or_val else 0
     elif kind == 'SORT':
@@ -276,7 +281,22 @@ def flatten_tree_v2(tree: ExprNode, env: CICEnvironment) -> Tuple[List[Tuple], i
             name = tree.name or ''
             cid = env.get_or_create(name)
             idx = len(nodes)
-            nodes.append((N_CONST, -1, -1, -1, cid, 0, 0))
+            
+            # Map specific constant names to GPU specialized node types
+            if name.endswith('.rec'):
+                nodes.append((N_REC, -1, -1, -1, cid, 0, 0))
+            elif name.endswith('.zero') or name == 'Nat.zero':
+                nodes.append((N_NAT_ZERO, -1, -1, -1, cid, 0, 0))
+            elif name.endswith('.succ') or name == 'Nat.succ':
+                nodes.append((N_NAT_SUCC, -1, -1, -1, cid, 0, 0))
+            elif name.endswith('.true') or name == 'Bool.true':
+                nodes.append((N_BOOL_TRUE, -1, -1, -1, cid, 0, 0))
+            elif name.endswith('.false') or name == 'Bool.false':
+                nodes.append((N_BOOL_FALSE, -1, -1, -1, cid, 0, 0))
+            elif name.endswith('.nil') or name.endswith('.cons') or name.endswith('.mk'):
+                nodes.append((N_CTOR, -1, -1, -1, cid, 0, 0))
+            else:
+                nodes.append((N_CONST, -1, -1, -1, cid, 0, 0))
             return idx
 
         elif kind == 'BVAR':
@@ -293,6 +313,12 @@ def flatten_tree_v2(tree: ExprNode, env: CICEnvironment) -> Tuple[List[Tuple], i
             val = tree.value if tree.value is not None else 0
             idx = len(nodes)
             nodes.append((N_NATLIT, -1, -1, -1, val, 0, 0))
+            return idx
+
+        elif kind == 'STRLIT':
+            val = tree.value if tree.value is not None else 0
+            idx = len(nodes)
+            nodes.append((N_STRLIT, -1, -1, -1, val, 0, 0))
             return idx
 
         elif kind == 'SORT':
@@ -499,6 +525,7 @@ def main():
 
     # Build environment
     env = get_default_env()
+    env.load_from_export(os.path.join(WORKDIR, "lean4", "exported_trees.txt"))
     print(f"\n{env.summary()}\n")
 
     # Compile GPU kernel
@@ -506,15 +533,19 @@ def main():
     from torch.utils.cpp_extension import load
     cic_gpu = load(
         name="cic_gpu_v2",
-        sources=[os.path.join(WORKDIR, "kernels", "cic_type_check.cu")],
+        sources=[os.path.join(WORKDIR, "kernels", "cic_engine.cu")],
         verbose=False
     )
     print("Kernel compiled OK")
 
     # Read exported trees (try v2 format first, fall back to v1)
     export_path = os.path.join(WORKDIR, 'lean4', 'exported_trees.txt')
-    with open(export_path, encoding='utf-8') as f:
-        text = f.read()
+    try:
+        with open(export_path, 'r', encoding='utf-8') as f:
+            text = f.read()
+    except UnicodeDecodeError:
+        with open(export_path, 'r', encoding='utf-16') as f:
+            text = f.read()
 
     # Detect format and parse
     if '=== SECTION:' in text or '--- TYPE ---' in text:

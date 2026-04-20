@@ -194,5 +194,8 @@ def exportConstType (env : Environment) (name : Name) : IO Unit := do
   -- Inductive types
   exportThmFull env `Nat
   exportThmFull env `Bool
+  exportThmFull env `List
+  exportThmFull env `String
+  exportThmFull env `Char
 
   IO.println "=== END EXPORT ==="

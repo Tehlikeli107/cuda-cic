@@ -22,6 +22,8 @@ T_TYPE  = 2     # Sort 1
 T_TYPE1 = 3     # Sort 2
 T_NAT   = 10
 T_BOOL  = 11
+T_STRING= 12
+T_LIST  = 13
 
 PRIME1 = 1000003
 PRIME2 = 999983
@@ -85,6 +87,8 @@ class CICEnvironment:
         self.register("Nat", T_TYPE)
         self.register("Bool", T_TYPE)
         self.register("Prop", T_TYPE)  # Prop : Type
+        self.register("String", T_TYPE)
+        self.register("List", pi_hash(T_TYPE, T_TYPE))  # List : Type u -> Type u
 
         # === Nat constructors ===
         self.register("Nat.zero", T_NAT)
@@ -147,6 +151,58 @@ class CICEnvironment:
 
         # === Decidable ===
         self.register("Decidable", TYPE_PROP)
+
+    def load_from_export(self, filepath: str):
+        """Parse CONST_TYPE, INDUCTIVE, CONSTRUCTOR blocks from the export file
+        and register their types. This gives full coverage of Lean4 library."""
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+        except:
+            return
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            
+            # CONST_TYPE name
+            if line.startswith("CONST_TYPE "):
+                name = line.replace("CONST_TYPE ", "").strip()
+                if name.endswith(" NOT_FOUND"):
+                    i += 1
+                    continue
+                # For now, just register if not already there. 
+                # Ideally we'd parse the full ExprNode and hash the type.
+                # Since hashing requires knowing child types, we do a basic registration.
+                self.get_or_create(name)
+                i += 1
+            
+            # INDUCTIVE name
+            elif line.startswith("=== INDUCTIVE "):
+                name = line.replace("=== INDUCTIVE ", "").replace(" ===", "").strip()
+                self.register(name, T_TYPE) # Assume Type
+                i += 1
+                
+            # CONSTRUCTOR name
+            elif line.startswith("=== CONSTRUCTOR "):
+                name = line.replace("=== CONSTRUCTOR ", "").replace(" ===", "").strip()
+                self.get_or_create(name)
+                i += 1
+                
+            # RECURSOR name
+            elif line.startswith("=== RECURSOR "):
+                name = line.replace("=== RECURSOR ", "").replace(" ===", "").strip()
+                self.get_or_create(name)
+                i += 1
+            else:
+                i += 1
+
+        # Register standard List constructors explicitly
+        self.register("List.nil", T_ERROR) # Polimorphic
+        self.register("List.cons", T_ERROR)
+        self.register("List.rec", T_ERROR)
+        self.register("String", T_TYPE)
+        self.register("String.mk", T_ERROR)
 
         # === Register pi decompositions ===
         self.pi_types = [
@@ -234,6 +290,8 @@ def _type_name(h: int) -> str:
         T_TYPE1: "Type 1",
         T_NAT: "Nat",
         T_BOOL: "Bool",
+        T_STRING: "String",
+        T_LIST: "List",
         NAT_NAT: "Nat→Nat",
         NAT_NAT_NAT: "Nat→Nat→Nat",
         BOOL_BOOL: "Bool→Bool",

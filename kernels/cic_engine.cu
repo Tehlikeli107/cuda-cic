@@ -42,6 +42,7 @@
 #define N_NAT_SUCC  11
 #define N_BOOL_TRUE 12
 #define N_BOOL_FALSE 13
+#define N_STRLIT    14
 #define N_NONE      -1
 
 // Type constants
@@ -51,6 +52,8 @@
 #define T_TYPE1   3
 #define T_NAT     10
 #define T_BOOL    11
+#define T_STRING  12
+#define T_LIST    13
 
 // Hash constants
 #define PRIME1      1000003LL
@@ -187,6 +190,26 @@ __global__ void engine_whnf_kernel(
     int64_t root = root_indices[bi];
     int steps = 0;
 
+    // --- Thread-Local Allocator (IOTA/Pattern Matching) ---
+    // En son node nerede bitiyor bulmamız lazım. Genelde MN'in yarısına kadarı Lean'den gelen ağaçla doludur.
+    // Şimdilik hızlıca son node'u bulmak yerine (ki O(MN) sürer) allocate etmek için "tersten"
+    // (MN - 1'den aşağıya doğru) bir pool kullanacağız.
+    int pool_ptr = MN - 1;
+
+    // Macro for fast thread-local allocation of a new node from the back of the MN chunk
+    #define ALLOC_NODE(kind, c1, c2, c3, a1, a2, lvl) do { \
+        if (pool_ptr >= 0 && node_types[base + pool_ptr] == N_NONE) { \
+            node_types[base + pool_ptr] = (kind); \
+            child1[base + pool_ptr] = (c1); \
+            child2[base + pool_ptr] = (c2); \
+            child3[base + pool_ptr] = (c3); \
+            aux1[base + pool_ptr] = (a1); \
+            aux2[base + pool_ptr] = (a2); \
+            levels[base + pool_ptr] = (lvl); \
+        } \
+        pool_ptr--; \
+    } while(0)
+
     for (int step = 0; step < MAX_WHNF_STEPS; step++) {
         if (root < 0 || root >= MN) break;
         int64_t ntype = node_types[base + root];
@@ -209,6 +232,85 @@ __global__ void engine_whnf_kernel(
                     root = body_idx;
                     steps++;
                     continue;
+                }
+            }
+            
+            // IOTA (Recursor): App(App(...App(Rec, motive), minor), major)
+            // If the head is a recursor and the major premise is a constructor we should reduce.
+            int spine[32];
+            int spine_idx = 0;
+            int head_idx = root;
+            
+            while (head_idx >= 0 && head_idx < MN && node_types[base + head_idx] == N_APP && spine_idx < 32) {
+                spine[spine_idx++] = child2[base + head_idx];
+                head_idx = child1[base + head_idx];
+            }
+            
+            if (head_idx >= 0 && head_idx < MN && node_types[base + head_idx] == N_REC) {
+                // head is N_REC. The last element in spine is the major premise.
+                int major_premise_idx = spine[0]; // spine[0] is the outermost argument
+                if (major_premise_idx >= 0 && major_premise_idx < MN) {
+                    int major_type = node_types[base + major_premise_idx];
+                    if (major_type == N_CTOR || major_type == N_NAT_ZERO || major_type == N_NAT_SUCC || major_type == N_BOOL_TRUE || major_type == N_BOOL_FALSE) {
+                        // TODO: Generic rule-based lookup
+                        // Phase 7.2: For now, implement fast path for known recursors
+                        int64_t rec_id = aux1[base + head_idx];
+                        
+                        // Let's assume we can map rec_id directly or we implement Nat and Bool first to test the alloc
+                        if (major_type == N_NAT_ZERO && spine_idx >= 2) {
+                            // Nat.rec motive base step Nat.zero -> base (which is spine[1])
+                            root = spine[1];
+                            steps++;
+                            continue;
+                        }
+                        else if (major_type == N_BOOL_TRUE && spine_idx >= 3) {
+                            // Bool.rec motive t_case f_case true -> t_case
+                            root = spine[2]; // the true case
+                            steps++;
+                            continue;
+                        }
+                        else if (major_type == N_BOOL_FALSE && spine_idx >= 3) {
+                            // Bool.rec motive t_case f_case false -> f_case
+                            root = spine[1]; // the false case
+                            steps++;
+                            continue;
+                        }
+                        else if (major_type == N_NAT_SUCC && spine_idx >= 3) {
+                            // spine[0] = (Nat.succ n)
+                            // spine[1] = step
+                            // spine[2] = base
+                            // spine[3] = motive (if present)
+                            
+                            int64_t n_idx = child1[base + major_premise_idx];
+                            int64_t step_idx = spine[1];
+                            
+                            // Rebuild (Nat.rec motive base step) which is just the head applied to motive, base, step
+                            // We can find this intermediate application node in the tree natively:
+                            // App( App( App(Rec, motive), base ), step )
+                            // We know this is exactly the parent of the major premise application.
+                            // In spine traversal, `spine_idx` counts arguments from outside in.
+                            // root is `App(App_step, major_premise)`
+                            int64_t app_step_idx = child1[base + root];
+                            
+                            // 1. Allocate: App(app_step_idx, n_idx)  == (Nat.rec motive base step n)
+                            ALLOC_NODE(N_APP, app_step_idx, n_idx, -1, 0, 0, 0);
+                            int64_t rec_call_idx = pool_ptr + 1;
+                            
+                            // 2. Allocate: App(step_idx, n_idx) == step n
+                            ALLOC_NODE(N_APP, step_idx, n_idx, -1, 0, 0, 0);
+                            int64_t step_n_idx = pool_ptr + 1;
+                            
+                            // 3. Allocate: App(step_n_idx, rec_call_idx) == step n (Nat.rec motive base step n)
+                            ALLOC_NODE(N_APP, step_n_idx, rec_call_idx, -1, 0, 0, 0);
+                            int64_t final_app_idx = pool_ptr + 1;
+                            
+                            if (final_app_idx >= 0) {
+                                root = final_app_idx;
+                                steps++;
+                                continue;
+                            }
+                        }
+                    }
                 }
             }
 
@@ -338,6 +440,10 @@ __global__ void engine_type_check_kernel(
         case N_BOOL_TRUE:
         case N_BOOL_FALSE:
             res = T_BOOL;
+            break;
+
+        case N_STRLIT:
+            res = T_STRING;
             break;
 
         case N_LAM: {
